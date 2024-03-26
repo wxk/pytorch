@@ -143,6 +143,14 @@ Value* tryConvertToType(
       } else if (concrete_int) {
         value = graph.insert(aten::Int, {value}, {}, loc);
       }
+    } else if (*value->type() == *BoolType::get()) {
+      if (concrete_float) {
+        value = graph.insert(aten::Float, {value}, {}, loc);
+      } else if (concrete_int) {
+        value = graph.insert(aten::Int, {value}, {}, loc);
+      } else if (concrete_number) {
+        value = graph.insert(aten::Int, {value}, {}, loc);
+      }
     }
 
     // Convert strings to device
@@ -546,17 +554,6 @@ MatchedSchema matchSchema(
     return *result;
   }
   throw ErrorReport(loc) << failure_messages.str();
-}
-
-MatchedSchema matchSchema(
-    const ::c10::FunctionSchema& schema,
-    const SourceRange& loc,
-    Graph& graph,
-    at::ArrayRef<Value*> args,
-    at::ArrayRef<NamedValue> kwargs) {
-  std::vector<NamedValue> named_args =
-      fmap(args, [](Value* v) { return NamedValue(v); });
-  return matchSchema(schema, loc, graph, named_args, kwargs);
 }
 
 static std::string prefixLine(

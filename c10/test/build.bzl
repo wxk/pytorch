@@ -20,6 +20,7 @@ def define_targets(rules):
         deps = [
             "//c10/core:base",
             "//c10/util:base",
+            "//c10/core:CPUAllocator",
             "@com_google_googletest//:gtest_main",
         ],
     )

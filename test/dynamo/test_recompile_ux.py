@@ -5,12 +5,16 @@ import weakref
 import torch
 
 import torch._dynamo
+import torch._dynamo.config
 import torch._dynamo.test_case
 import torch._dynamo.testing
 
+import torch._logging
+from torch.testing._internal.logging_utils import kwargs_to_settings, log_settings
+
 
 class RecompileUxTests(torch._dynamo.test_case.TestCase):
-    # TODO(whc) dynamo actualy recompiles one more time than the cache limit
+    # TODO(whc) dynamo actually recompiles one more time than the cache limit
     cache_limit = 1
 
     @classmethod
@@ -70,10 +74,11 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
         # self.assertEqual(counters["frames"]["ok"], 1 + self.cache_limit)
 
         # compile_counter only sees frames that were fed to the backend compiler,
-        # which is a subset of counters["frames"]["ok"] -- probably becuase
+        # which is a subset of counters["frames"]["ok"] -- probably because
         # counters["frames"]["ok"] includes frames not containing torch ops?
         self.assertEqual(compile_counter.frame_count, self.cache_limit)
 
+    @torch._dynamo.config.patch("automatic_dynamic_shapes", False)
     def test_dynamic_input(self):
         def model(input):
             return input + input
@@ -101,7 +106,7 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
     def test_nvfuser_guards(self):
         # we may want to model dynamo's guards sufficiently after nvfuser's ProfilingExecutor guards
         # such that we ensure dynamo is in charge of all the recompilations at the top level,
-        # and we could thus simplfy the underlying torchscript executor
+        # and we could thus simplify the underlying torchscript executor
         def func(a, b, c):
             return a + b * c
 
@@ -162,7 +167,7 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
         cache_fail_test(
             a,
             a.clone().as_strided((3, 4, 5), stride=(1, 3, 12)),
-            "tensor 'L['a']' strides mismatch at index 0. expected 20, actual 1",
+            "tensor 'L['a']' stride mismatch at index 0. expected 20, actual 1",
         )
         cache_fail_test(
             a, a[0, :, :], "tensor 'L['a']' rank mismatch. expected 3, actual 2"
@@ -200,8 +205,84 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
             "expected type of 'L['b']' to be a tensor type, ' but found <class 'int'>",
         )
 
+    @torch._dynamo.config.patch("cache_size_limit", 32)
+    def test_multiple_guard_fails(self):
+        failure_reasons = []
 
-# TODO(jansel): these pass with pytest, but not with pytorch CI
-# if __name__ == "__main__":
-#     from torch._dynamo.testing import run_tests
-#     run_tests()
+        def guard_fail_fn(failure):
+            failure_reasons.append(failure[0])
+
+        def f(x):
+            return torch.relu(x)
+
+        opt_f = torch._dynamo.optimize(
+            backend="eager", guard_fail_fn=guard_fail_fn, dynamic=False
+        )(f)
+
+        for i in range(5):
+            failure_reasons.clear()
+            opt_f(torch.randn(8 + i))
+
+        failure_str = "\n".join(failure_reasons)
+        for line in """\
+tensor 'L['x']' size mismatch at index 0. expected 11, actual 12
+tensor 'L['x']' size mismatch at index 0. expected 10, actual 12
+tensor 'L['x']' size mismatch at index 0. expected 9, actual 12
+tensor 'L['x']' size mismatch at index 0. expected 8, actual 12""".split(
+            "\n"
+        ):
+            self.assertIn(
+                line,
+                failure_str,
+            )
+
+    @torch._dynamo.config.patch("cache_size_limit", 32)
+    def test_multiple_guard_fails_report_all(self):
+        with log_settings(kwargs_to_settings(recompiles_verbose=True)):
+            failure_reasons = []
+
+            def guard_fail_fn(failure):
+                failure_reasons.append(failure[0])
+
+            def f(x):
+                return torch.ones(len(x), x[-1])
+
+            opt_f = torch._dynamo.optimize(
+                backend="eager", guard_fail_fn=guard_fail_fn, dynamic=False
+            )(f)
+
+            opt_f([4, 5, 6])
+
+            def filter_reasons():
+                return "\n".join(
+                    [
+                        line
+                        for line in "\n".join(failure_reasons).splitlines()
+                        if not line.startswith("___check_type_id")
+                    ]
+                )
+
+            failure_reasons.clear()
+            opt_f([7, 8])
+
+            for line in """\
+len(L['x']) == 3""".split(
+                "\n"
+            ):
+                self.assertIn(line, filter_reasons())
+
+            failure_reasons.clear()
+            opt_f([9])
+
+            for line in """\
+len(L['x']) == 2
+len(L['x']) == 3""".split(
+                "\n"
+            ):
+                self.assertIn(line, filter_reasons())
+
+
+if __name__ == "__main__":
+    from torch._dynamo.test_case import run_tests
+
+    run_tests()

@@ -1,9 +1,10 @@
 #pragma once
 
 #include <c10/core/AutogradState.h>
-#include <c10/core/GradMode.h>
+#include <c10/core/DispatchKey.h>
+#include <c10/core/DispatchKeySet.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
-#include <c10/macros/Macros.h>
+#include <c10/macros/Export.h>
 
 namespace c10 {
 

@@ -79,6 +79,7 @@ def define_targets(rules):
         visibility = ["//visibility:public"],
         deps = [
             ":ScalarType",
+            "//third_party/cpuinfo",
             "//c10/macros",
             "//c10/util:TypeCast",
             "//c10/util:base",

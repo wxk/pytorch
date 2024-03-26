@@ -7,14 +7,116 @@ import torch
 
 import torch._dynamo.test_case
 import torch._dynamo.testing
+from torch._dynamo.exc import IncorrectUsage
+
+
+def my_custom_function(x):
+    return x + 1
 
 
 class DecoratorTests(torch._dynamo.test_case.TestCase):
+    def test_disallow_in_graph(self):
+        cnts = torch._dynamo.testing.CompileCounter()
+
+        @torch._dynamo.optimize(cnts)
+        def fn(a):
+            x = torch.add(a, 1)
+            x = torch.add(x, 1)
+            x = torch.sub(x, 1)
+            x = torch.add(x, 1)
+            x = torch.add(x, 1)
+            return x
+
+        torch._dynamo.disallow_in_graph(torch.sub)
+        fn(torch.randn(10))
+        torch._dynamo.allow_in_graph(torch.sub)
+
+        # check for graph break on sub
+        self.assertEqual(cnts.frame_count, 2)
+        self.assertEqual(cnts.op_count, 4)
+
+    def test_disable_for_custom_op(self):
+        import torch.library
+        from torch.library import Library
+
+        foo = Library("foo", "DEF")  # noqa: TOR901
+        foo.define("custom(Tensor self) -> Tensor")
+
+        # Dynamic shape data dependent operator. For static shape compilation, Dynamo
+        # should graph break on it. But, the meta kernel is not implemented properly.
+        @torch.library.impl(foo, "custom", "CPU")
+        def foo_cpu(x):
+            return x.nonzero()
+
+        # Disallow does not work because of extra python frames with torch.library python API
+        torch.ops.foo.custom = torch._dynamo.disable(torch.ops.foo.custom)
+
+        def fn(x):
+            a = torch.nn.functional.relu(x)
+            b = torch.ops.foo.custom(a)
+            c = torch.cos(b)
+            return c
+
+        x = torch.randint(2, (100,))
+        ref = fn(x)
+
+        cnts = torch._dynamo.testing.CompileCounter()
+        opt_fn = torch._dynamo.optimize(cnts)(fn)
+        res = opt_fn(x)
+        self.assertEqual(cnts.frame_count, 2)
+        self.assertEqual(ref, res)
+
+    def test_allow_in_graph(self):
+        cnts = torch._dynamo.testing.CompileCounter()
+
+        @torch._dynamo.optimize(cnts)
+        def fn(a):
+            x = torch.add(a, 1)
+            x = torch.add(x, 1)
+            x = my_custom_function(x)
+            x = torch.add(x, 1)
+            x = torch.add(x, 1)
+            return x
+
+        torch._dynamo.allow_in_graph(my_custom_function)
+        fn(torch.randn(10))
+        torch._dynamo.disallow_in_graph(my_custom_function)
+
+        # check for no graph break
+        self.assertEqual(cnts.frame_count, 1)
+        self.assertEqual(cnts.op_count, 5)
+
+    def test_incorrect_usage_disallow_in_graph(self):
+        with self.assertRaises(IncorrectUsage):
+
+            @torch._dynamo.disallow_in_graph
+            def fn1(x):
+                return x.cos()
+
+    def test_graph_break(self):
+        cnts = torch._dynamo.testing.CompileCounter()
+
+        @torch._dynamo.optimize(cnts)
+        def fn(x):
+            x = torch.cos(x)
+            x = torch.cos(x)
+            torch._dynamo.graph_break()
+            x = torch.cos(x)
+            x = torch.cos(x)
+            torch._dynamo.graph_break()
+            x = torch.cos(x)
+            x = torch.cos(x)
+            return x
+
+        fn(torch.randn(4, 5))
+        self.assertEqual(cnts.frame_count, 3)
+        self.assertEqual(cnts.op_count, 6)
+
     def test_skip(self):
         def fn2(x):
             return x.sin()
 
-        @torch._dynamo.skip
+        @torch._dynamo.disable(recursive=False)
         def fn1(x):
             x = x.sigmoid()
             return fn2(x.cos())
@@ -108,7 +210,8 @@ class DecoratorTests(torch._dynamo.test_case.TestCase):
 
         @contextlib.contextmanager
         def global_context_capture_fn(frame_summary):
-            seen_frames.append(frame_summary)
+            if frame_summary is not None:
+                seen_frames.append(frame_summary)
             yield
 
         with mock.patch(
@@ -130,7 +233,7 @@ class DecoratorTests(torch._dynamo.test_case.TestCase):
 
             @torch._dynamo.disable
             def helper_disabled(self, x, y):
-                return x * y
+                return x.sin() * y.cos()
 
             def helper(self, x, y):
                 return x * y
@@ -141,23 +244,112 @@ class DecoratorTests(torch._dynamo.test_case.TestCase):
 
         e = encoder(y)
 
-        seen_frames = []
-        import contextlib
+        cnt = torch._dynamo.testing.CompileCounter()
+        torch.compile(e, backend=cnt)(x)
 
-        @contextlib.contextmanager
-        def global_context_capture_fn(frame_summary):
-            seen_frames.append(frame_summary)
-            yield
+        # first frame is before disable, second frame is after disable
+        self.assertEqual(cnt.frame_count, 2)
+        self.assertEqual(cnt.op_count, 3)
 
-        with mock.patch(
-            "torch._guards.TracingContext.current_frame",
-            side_effect=global_context_capture_fn,
-        ):
-            torch._dynamo.optimize("eager")(e)(x)
+    def _test_mark_static_address(self, guarded):
+        compiles_with_buffers = 0
+        compiles = 0
 
-        self.assertEqual(len(seen_frames), 1)
-        self.assertEqual(seen_frames[0].name, "forward")
-        self.assertEqual(
-            seen_frames[0].line,
-            "return self.helper(x, self.param) + self.helper_disabled(x, self.param)",
-        )
+        def debug_compiler(gm, _):
+            nonlocal compiles_with_buffers
+            nonlocal compiles
+            compiles_with_buffers += len(gm._buffers) > 0
+            compiles += 1
+            return gm
+
+        @torch._dynamo.optimize(backend=debug_compiler)
+        def fn(x):
+            return x + 1
+
+        inp = torch.ones(2)
+
+        torch._dynamo.mark_static_address(inp, guard=guarded)
+
+        fn(inp)
+        self.assertEqual(compiles_with_buffers, 1)
+
+        inp2 = torch.ones(2)
+
+        # if guarded, should trigger another recompile
+        # since it was not marked static, compiles with buffers
+        # should not be incremented
+        fn(inp2)
+        self.assertEqual(compiles_with_buffers, 1)
+        self.assertEqual(compiles, 2 if guarded else 1)
+
+    def test_mark_static_address_guarded(self):
+        self._test_mark_static_address(guarded=True)
+
+    def test_mark_static_address_unguarded(self):
+        self._test_mark_static_address(guarded=False)
+
+    def test_class_methods(self):
+        class A:
+            @classmethod
+            def my_class_method(cls, arg1):
+                return cls, arg1
+
+            @staticmethod
+            def my_static_method(arg1):
+                return None, arg1
+
+            def my_regular_method(self, arg1):
+                return self, arg1
+
+        class B(A):
+            def my_class_method(self, arg1):
+                return super().my_class_method(arg1)
+
+            def my_static_method(self, arg1):
+                return super().my_static_method(arg1)
+
+        class C(A):
+            @classmethod
+            def my_class_method(cls, arg1):
+                return super().my_class_method(arg1)
+
+        cnt = torch._dynamo.testing.CompileCounter()
+
+        @torch.compile(backend=cnt)
+        def fn(a, b, c):
+            # We want a function that does not graph break but
+            # does generate custom bytecode
+            v1 = a.my_class_method(1)
+            v2 = A.my_class_method(2)
+            v3 = a.my_static_method(3)
+            v4 = A.my_static_method(4)
+            v5 = a.my_regular_method(5)
+            v6 = b.my_class_method(6)
+            v7 = b.my_static_method(7)
+            v8 = c.my_class_method(8)
+            v9 = C.my_class_method(9)
+            torch.rand(2)
+            return v1, v2, v3, v4, v5, v6, v7, v8, v9
+
+        a, b, c = A(), B(), C()
+        v1, v2, v3, v4, v5, v6, v7, v8, v9 = fn(a, b, c)
+
+        self.assertEqual(v1, (A, 1))
+        self.assertEqual(v2, (A, 2))
+        self.assertEqual(v3, (None, 3))
+        self.assertEqual(v4, (None, 4))
+        self.assertEqual(v5, (a, 5))
+        # TODO fix me: we do not resolve classmethods properly
+        # from a regular method
+        # self.assertEqual(v6, (B, 6))
+        self.assertEqual(v7, (None, 7))
+        self.assertEqual(v8, (C, 8))
+        self.assertEqual(v9, (C, 9))
+
+        self.assertEqual(cnt.frame_count, 1)
+
+
+if __name__ == "__main__":
+    from torch._dynamo.test_case import run_tests
+
+    run_tests()

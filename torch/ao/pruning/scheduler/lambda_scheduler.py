@@ -8,7 +8,7 @@ class LambdaSL(BaseScheduler):
     """Sets the sparsity level of each parameter group to the final sl
     times a given function. When last_epoch=-1, sets initial sl as zero.
     Args:
-        pruner (BasePruner): Wrapped pruner.
+        sparsifier (BaseSparsifier): Wrapped sparsifier.
         sl_lambda (function or list): A function which computes a multiplicative
             factor given an integer parameter epoch, or a list of such
             functions, one for each group in sparsifier.param_groups.
@@ -34,8 +34,7 @@ class LambdaSL(BaseScheduler):
             self.sl_lambdas = [sl_lambda] * len(sparsifier.groups)
         else:
             if len(sl_lambda) != len(sparsifier.groups):
-                raise ValueError("Expected {} lr_lambdas, but got {}".format(
-                    len(sparsifier.groups), len(sl_lambda)))
+                raise ValueError(f"Expected {len(sparsifier.groups)} lr_lambdas, but got {len(sl_lambda)}")
             self.sl_lambdas = list(sl_lambda)
         super().__init__(sparsifier, last_epoch, verbose)
 

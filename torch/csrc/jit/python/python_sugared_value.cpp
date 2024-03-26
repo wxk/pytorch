@@ -82,9 +82,7 @@ FunctionSchema PythonValue::getSchema(
     rets.emplace_back(Argument("0", ret_type, {}, {}, false));
   } else {
     // Use the provided type signature
-    std::vector<TypePtr> arg_types;
-    TypePtr ret_type;
-    std::tie(arg_types, ret_type) =
+    auto [arg_types, ret_type] =
         py::cast<std::pair<std::vector<TypePtr>, TypePtr>>(signature);
 
     // arg_types does not include self but param_names does, so adjust for that
@@ -373,7 +371,8 @@ SugaredValuePtr ModuleValue::getitem(
     throw ErrorReport(loc)
         << "Unable to extract string literal index. "
         << "ModuleDict indexing is only supported with string literals. "
-        << "Enumeration of ModuleDict is supported, e.g. 'for k, v in self.items(): ...'";
+        << "For example, 'i = \"a\"; self.layers[i](x)' will fail because i is not a literal. "
+        << "Enumeration of ModuleDict is supported, e.g. 'for k, v in self.items(): out = v(inp)'";
   }
   throw ErrorReport(loc)
       << "Only ModuleList, Sequential, ModuleDict, "
@@ -1021,12 +1020,7 @@ TypePtr registerNamedTuple(
       py::module::import("torch._jit_internal")
           .attr("_get_named_tuple_properties")(obj, loc, py::cpp_function(rcb));
 
-  std::string unqualName;
-  std::vector<std::string> field_names;
-  std::vector<TypePtr> field_types;
-  std::vector<py::object> objects;
-
-  std::tie(unqualName, field_names, field_types, objects) = py::cast<std::tuple<
+  auto [unqualName, field_names, field_types, objects] = py::cast<std::tuple<
       std::string,
       std::vector<std::string>,
       std::vector<TypePtr>,

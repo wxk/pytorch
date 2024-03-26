@@ -250,7 +250,7 @@ std::ostream& operator<<(std::ostream& stream, const CheckWithinDomains<T>& dmn)
     stream << "Domain: ";
     if (dmn.ArgsDomain.size() > 0) {
         for (const DomainRange<T>& x : dmn.ArgsDomain) {
-            if (std::is_same<T, int8_t>::value || std::is_same<T, uint8_t>::value) {
+            if constexpr (std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>) {
                 stream << "\n{ " << static_cast<int>(x.start) << ", " << static_cast<int>(x.end) << " }";
             }
             else {
@@ -458,7 +458,7 @@ std::enable_if_t<is_complex<Complex<T>>::value, void> filter_zero(Complex<T>& va
 
 template <typename T>
 void filter_int_minimum(T& val) {
-    if (!std::is_integral<T>::value) return;
+    if constexpr (!std::is_integral_v<T>) return;
     if (val == std::numeric_limits<T>::min()) {
         val = 0;
     }
@@ -478,7 +478,7 @@ std::enable_if_t<is_complex<T>::value, void> filter_sub_overflow(T& a, T& b)
 
 template <typename T>
 std::enable_if_t < !is_complex<T>::value, void> filter_add_overflow(T& a, T& b) {
-    if (std::is_integral<T>::value == false) return;
+    if constexpr (std::is_integral_v<T> == false) return;
     T max = std::numeric_limits<T>::max();
     T min = std::numeric_limits<T>::min();
     // min <= (a +b) <= max;
@@ -497,7 +497,7 @@ std::enable_if_t < !is_complex<T>::value, void> filter_add_overflow(T& a, T& b) 
 
 template <typename T>
 std::enable_if_t < !is_complex<T>::value, void> filter_sub_overflow(T& a, T& b) {
-    if (std::is_integral<T>::value == false) return;
+    if constexpr (std::is_integral_v<T> == false) return;
     T max = std::numeric_limits<T>::max();
     T min = std::numeric_limits<T>::min();
     // min <= (a-b) <= max;
@@ -534,7 +534,7 @@ filter_div_ub(T& val1, T& val2) {
 template <typename T>
 std::enable_if_t<!is_complex<T>::value, void>
 filter_mult_overflow(T& val1, T& val2) {
-    if (std::is_integral<T>::value == false) return;
+    if constexpr (std::is_integral_v<T> == false) return;
     if (!is_zero(val2)) {
         T c = (std::numeric_limits<T>::max() - 1) / val2;
         if (std::abs(val1) >= c) {
@@ -888,13 +888,13 @@ public:
         else
         {
             for (const auto i : c10::irange(sizeX)) {
-                if (std::is_same<UVT, float>::value)
+                if constexpr (std::is_same_v<UVT, float>)
                 {
                     if (!check_both_nan(expArr[i], actArr[i])) {
                         EXPECT_FLOAT_EQ(expArr[i], actArr[i]) << getDetail(i / unitStorageCount);
                     }
                 }
-                else if (std::is_same<UVT, double>::value)
+                else if constexpr (std::is_same_v<UVT, double>)
                 {
                     if (!check_both_nan(expArr[i], actArr[i]))
                     {
@@ -949,8 +949,7 @@ void test_unary(
         UVT start = dmn_argc > 0 ? dmn.ArgsDomain[0].start : default_start;
         UVT end = dmn_argc > 0 ? dmn.ArgsDomain[0].end : default_end;
         ValueGen<VT> generator(start, end, seed.add(changeSeedBy));
-        for (const auto trial : c10::irange(trialCount)) {
-            (void)trial; // Suppress unused variable warning
+        for (C10_UNUSED const auto trial : c10::irange(trialCount)) {
             for (const auto k : c10::irange(el_count)) {
                 vals[k] = generator.get();
                 call_filter(filter, vals[k]);
@@ -1009,8 +1008,7 @@ void test_binary(
         UVT end1 = dmn_argc > 1 ? dmn.ArgsDomain[1].end : default_end;
         ValueGen<VT> generator0(start0, end0, seed.add(changeSeedBy));
         ValueGen<VT> generator1(start1, end1, seed.add(changeSeedBy + 1));
-        for (const auto trial : c10::irange(trialCount)) {
-            (void)trial; // Suppress unused variable warning
+        for (C10_UNUSED const auto trial : c10::irange(trialCount)) {
             for (const auto k : c10::irange(el_count)) {
                 vals0[k] = generator0.get();
                 vals1[k] = generator1.get();
@@ -1075,8 +1073,7 @@ void test_ternary(
         ValueGen<VT> generator1(start1, end1, seed.add(changeSeedBy + 1));
         ValueGen<VT> generator2(start2, end2, seed.add(changeSeedBy + 2));
 
-        for (const auto trial : c10::irange(trialCount)) {
-            (void)trial; // Suppress unused variable warning
+        for (C10_UNUSED const auto trial : c10::irange(trialCount)) {
             for (const auto k : c10::irange(el_count)) {
                 vals0[k] = generator0.get();
                 vals1[k] = generator1.get();
@@ -1206,7 +1203,7 @@ template <typename T>
 std::enable_if_t<is_complex<Complex<T>>::value, Complex<T>> local_division(Complex<T> x, Complex<T> y) {
 #if defined(TEST_AGAINST_DEFAULT)
     return x / y;
-#else
+#else /* defined(TEST_AGAINST_DEFAULT) */
     //re = (ac + bd)/abs_2()
     //im = (bc - ad)/abs_2()
     T x_real = x.real();
@@ -1214,7 +1211,38 @@ std::enable_if_t<is_complex<Complex<T>>::value, Complex<T>> local_division(Compl
     T y_real = y.real();
     T y_imag = y.imag();
     PreventFma noFma;
-#if defined(CPU_CAPABILITY_VSX) || defined(CPU_CAPABILITY_ZVECTOR)
+#if defined(CPU_CAPABILITY_ZVECTOR)
+    T abs_c = std::abs(y_real);
+    T abs_d = std::abs(y_imag);
+    T scale = 1.0 / std::max(abs_c, abs_d);
+
+    T a_sc = x_real * scale; // a/sc
+    T b_sc = x_imag * scale; // b/sc
+    T c_sc = y_real * scale; // c/sc
+    T d_sc = y_imag * scale; // d/sc
+
+    T ac_sc2 = a_sc * c_sc; // ac/sc^2
+    T bd_sc2 = b_sc * d_sc; // bd/sc^2
+
+    T neg_d_sc = -1.0 * d_sc; // -d/sc^2
+
+    T neg_ad_sc2 = a_sc * neg_d_sc; // -ad/sc^2
+    T bc_sc2 = b_sc * c_sc; // bc/sc^2
+
+    T ac_bd_sc2 = noFma.add(ac_sc2, bd_sc2); // (ac+bd)/sc^2
+    T bc_ad_sc2 = noFma.add(bc_sc2, neg_ad_sc2); // (bc-ad)/sc^2
+
+    T c2_sc2 = c_sc * c_sc; // c^2/sc^2
+    T d2_sc2 = d_sc * d_sc; // d^2/sc^2
+
+    T c2_d2_sc2 = noFma.add(c2_sc2, d2_sc2); // (c^2+d^2)/sc^2
+
+    T rr = ac_bd_sc2 / c2_d2_sc2; // (ac+bd)/(c^2+d^2)
+    T ii = bc_ad_sc2 / c2_d2_sc2; // (bc-ad)/(c^2+d^2)
+
+    return Complex<T>(rr, ii);
+#else /* defined(CPU_CAPABILITY_ZVECTOR) */
+#if defined(CPU_CAPABILITY_VSX)
     //check multiplication considerin swap and fma
     T rr = x_real * y_real;
     T ii = x_imag * y_real;
@@ -1222,14 +1250,14 @@ std::enable_if_t<is_complex<Complex<T>>::value, Complex<T>> local_division(Compl
     rr = fma(x_imag, y_imag, rr);
     ii = fma(x_real, neg_imag, ii);
     //b.abs_2
-#else
+#else /* defined(CPU_CAPABILITY_VSX) */
     T ac = x_real * y_real;
     T bd = x_imag * y_imag;
     T ad = x_real * y_imag;
     T bc = x_imag * y_real;
     T rr = noFma.add(ac, bd);
     T ii = noFma.sub(bc, ad);
-#endif
+#endif /* defined(CPU_CAPABILITY_VSX) */
     //b.abs_2()
     T abs_rr = y_real * y_real;
     T abs_ii = y_imag * y_imag;
@@ -1237,7 +1265,8 @@ std::enable_if_t<is_complex<Complex<T>>::value, Complex<T>> local_division(Compl
     rr = rr / abs_2;
     ii = ii / abs_2;
     return Complex<T>(rr, ii);
-#endif
+#endif /* defined(CPU_CAPABILITY_ZVECTOR) */
+#endif /* defined(TEST_AGAINST_DEFAULT) */
 }
 
 

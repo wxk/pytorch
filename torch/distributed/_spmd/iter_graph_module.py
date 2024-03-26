@@ -10,19 +10,21 @@ from torch.distributed._spmd.graph_utils import (
     get_output,
     is_leaf_subgraph,
 )
+from torch.distributed._spmd.partial_lower import partial_lower
 from torch.fx.graph import _PyTreeCodeGen, PythonCode
 from torch.fx.node import Argument
 from torch.profiler import record_function
-from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
+from torch.utils import _pytree as pytree
+from torch.utils._pytree import tree_flatten, tree_map, tree_map_only, tree_unflatten
 
 
 logger: logging.Logger = logging.getLogger("IterGraphModule")
 
 
 class IterGraph(fx.Graph):
-    """
-    ``IterGraph`` is used to perform cross-iteration optimization. ``IterGraph``
-    keeps track of the 3 graphs, self (the original graph), setup graph, and
+    """``IterGraph`` is used to perform cross-iteration optimization.
+
+    ``IterGraph`` keeps track of the 3 graphs, self (the original graph), setup graph, and
     cleanup graph. The 3 graphs should be identical copies of a ``fx.Graph``.
 
     IterGraph subclass fx.Graph to override the necessary APIs that will be used
@@ -125,18 +127,17 @@ class IterGraph(fx.Graph):
     def _forward_subgraph_inputs(
         self, subgraph: List[fx.Node], graph: fx.Graph, erase_node: bool
     ) -> int:
-        """
-        This function turns the inputs of a subgraph into the extra output
-        of the entire graph. If ``erase_node`` is True, the subgraph will be
-        erased from the graph -- essentially forward the inputs of the subgraph
-        to the output of the graph.
+        """Turn the inputs of a subgraph into the extra output of the entire graph.
+
+        If ``erase_node`` is True, the subgraph will be erased from the graph -- essentially forward the inputs
+        of the subgraph to the output of the graph.
         """
         output = get_output(graph)
         inputs = []
         all_nodes: Set[fx.Node] = set(subgraph)
 
         for node in subgraph:
-            node_inputs, _ = tree_flatten((node.args, node.kwargs))
+            node_inputs = pytree.arg_tree_leaves(*node.args, **node.kwargs)
             for _input in node_inputs:
                 if not isinstance(_input, fx.Node):
                     continue
@@ -151,10 +152,25 @@ class IterGraph(fx.Graph):
             for node in reversed(subgraph):
                 if len(node.users) == 1:
                     key = next(iter(node.users.keys()))
-                    # This is the optimizer case where IterGraph functionalize
-                    # the optimizer. Remove the dependency.
-                    if key not in cast(List[Any], output.args[0]) and key == output:
-                        node.users.clear()
+                    if key == output:
+                        flatten_args, spec = tree_flatten((output.args, output.kwargs))
+                        if node not in flatten_args:
+                            # This optimizer node from the legacy _SPMD tracing.
+                            node.users.clear()
+                        elif str(node.target).startswith("aten.copy_"):
+                            # This is the case where the optimizer is
+                            # functionalized with copy_.
+                            for i in range(len(flatten_args)):
+                                if flatten_args[i] == node:
+                                    flatten_args[i] = node.args[0]
+                        else:
+                            # We have not figured out semantics of forwarding
+                            # all diff ops.
+                            raise RuntimeError(
+                                f"IterGraph does not how to forward the output of {node}"
+                            )
+                        output.args, output.kwargs = tree_unflatten(flatten_args, spec)
+
                 # This is the step case where there is a virtual data dependency
                 # (in-place update) between step and optimizer. And
                 # functionalize_optim add this dependency
@@ -202,10 +218,10 @@ class IterGraph(fx.Graph):
     def _forward_inputs_to_subgraph(
         self, subgraph: List[fx.Node], graph: fx.Graph, extra_input: int
     ) -> None:
-        """
-        This function creates extra input nodes and forward the input nodes to
-        the ``subgraph``. The external input nodes of ``subgraph`` (nodes that
-        are not in ``subgraph``) will replaced by the newly created input nodes.
+        """Create extra input nodes and forward the input nodes to the ``subgraph``.
+
+        The external input nodes of ``subgraph`` (nodes that are not in ``subgraph``) will replaced by the newly
+        created input nodes.
         """
         placeholders = [node for node in graph.nodes if str(node.op) == "placeholder"]
         assert placeholders, "No placeholders are found"
@@ -231,7 +247,7 @@ class IterGraph(fx.Graph):
             node_inputs, spec = tree_flatten((node.args, node.kwargs))
             new_node_inputs = []
             for input_node in node_inputs:
-                if input_node in all_nodes or not isinstance(input_node, fx.Node):
+                if not isinstance(input_node, fx.Node) or input_node in all_nodes:
                     new_node_inputs.append(input_node)
                 else:
                     new_node_inputs.append(new_input_nodes[new_input_index])
@@ -241,8 +257,12 @@ class IterGraph(fx.Graph):
             new_input_nodes
         ), f"More inputs than needed {len(new_input_nodes)} > {new_input_index}"
 
-        # Update the in_spec of _PyTreeCodeGen
-        if isinstance(graph._codegen, _PyTreeCodeGen):
+        # Update the in_spec of _PyTreeCodeGen if in_spec is not None (the new
+        # SPMD makes in_spec as None).
+        if (
+            isinstance(graph._codegen, _PyTreeCodeGen)
+            and graph._codegen.pytree_info.in_spec is not None
+        ):
             codegen = graph._codegen
             original_tree_in = tree_unflatten(placeholders, codegen.pytree_info.in_spec)
             _, in_spec = tree_flatten(tuple(list(original_tree_in) + new_input_nodes))
@@ -254,8 +274,8 @@ class IterGraph(fx.Graph):
     def move_to_next_iter_before(
         self, subgraph: List[fx.Node], target_node: fx.Node
     ) -> None:
-        """
-        Move the ``subgraph`` to the next iteration before ``target_node``.
+        """Move the ``subgraph`` to the next iteration before ``target_node``.
+
         The ``subgraph`` is a list of fx.Node and must satisfy the following
         restrictions:
             1. The order of the nodes in ``subgraph`` must obey the topological
@@ -275,7 +295,7 @@ class IterGraph(fx.Graph):
             raise ValueError(
                 "The target nodes for ``move_to_next_iter_before`` must "
                 "satisfy one of the following conditions: 1) the user of the "
-                "node is in the target nodes, 2) the user is the ouput of the "
+                "node is in the target nodes, 2) the user is the output of the "
                 "graph, 3) there are no users -- the node is a side-effect node. "
             )
 
@@ -486,32 +506,43 @@ class IterGraph(fx.Graph):
             ), f"The actual target node is None, {target_node}."
             actual_target_node.append(actual_node)
 
-    def node_update_arg(self, node: fx.Node, idx: int, arg: Argument) -> None:
+    def node_set_args(self, node: fx.Node, args: Tuple[Argument, ...]) -> None:
         if self._freeze_cross_iter_movement:
-            node.update_arg(int, arg)
+            node.args = args
             return
 
-        setup_arg = tree_map(
-            lambda _arg: self._lookup_node(_arg, self.setup_graph)
-            if isinstance(_arg, fx.Node)
-            else _arg,
-            arg,
+        setup_args = tree_map_only(
+            fx.Node, lambda _arg: self._lookup_node(_arg, self.setup_graph), args
         )
         setup_node = self._lookup_node(node, self.setup_graph)
-        assert setup_node is not None, "setup_node is None"
-        setup_node.update_arg(idx, setup_arg)
-
-        node.update_arg(idx, arg)
-
-        cleanup_arg = tree_map(
-            lambda _arg: self._lookup_node(_arg, self.cleanup_graph)
-            if isinstance(_arg, fx.Node)
-            else _arg,
-            arg,
+        assert setup_node is not None
+        setup_node.args = setup_args
+        cleanup_args = tree_map_only(
+            fx.Node, lambda _arg: self._lookup_node(_arg, self.cleanup_graph), args
         )
         cleanup_node = self._lookup_node(node, self.cleanup_graph)
-        assert cleanup_node is not None, "cleanup_node is None"
-        cleanup_node.update_arg(idx, cleanup_arg)
+        assert cleanup_node is not None
+        cleanup_node.args = cleanup_args
+        node.args = args
+
+    def node_set_kwargs(self, node: fx.Node, kwargs: Dict[str, Argument]) -> None:
+        if self._freeze_cross_iter_movement:
+            node.kwargs = kwargs
+            return
+
+        setup_kwargs = tree_map_only(
+            fx.Node, lambda _arg: self._lookup_node(_arg, self.setup_graph), kwargs
+        )
+        setup_node = self._lookup_node(node, self.setup_graph)
+        assert setup_node is not None
+        setup_node.kwargs = setup_kwargs
+        cleanup_kwargs = tree_map_only(
+            fx.Node, lambda _arg: self._lookup_node(_arg, self.cleanup_graph), kwargs
+        )
+        cleanup_node = self._lookup_node(node, self.cleanup_graph)
+        assert cleanup_node is not None
+        cleanup_node.kwargs = cleanup_kwargs
+        node.kwargs = kwargs
 
     def node_replace_all_uses_with(
         self,
@@ -530,7 +561,7 @@ class IterGraph(fx.Graph):
                 delete_user_cb,
                 propagate_meta=propagate_meta,
             )
-        return ret
+        return ret  # type: ignore[possibly-undefined]
 
     def node_add_user(self, node: fx.Node, user: Any) -> None:
         for graph in self._all_graphs:
@@ -576,8 +607,8 @@ class IterGraph(fx.Graph):
                 "_foreach_add_",
             ):
                 step_node = node
-                self.node_add_user(optim_node, output_node)
-                self.node_add_user(step_node, optim_node)
+                self.node_add_user(optim_node, output_node)  # type: ignore[possibly-undefined]
+                self.node_add_user(step_node, optim_node)  # type: ignore[possibly-undefined]
 
     def defunctionalize_optim(self) -> None:
         # TODO: remove this API after DCE is not used with IterGraph
@@ -593,16 +624,16 @@ class IterGraph(fx.Graph):
                     "_foreach_add_",
                 ):
                     step_node = node
-                    optim_node.users.pop(output_node, None)
-                    step_node.users.pop(optim_node, None)
+                    optim_node.users.pop(output_node, None)  # type: ignore[possibly-undefined]
+                    step_node.users.pop(optim_node, None)  # type: ignore[possibly-undefined]
 
     def freeze_cross_iter_movement(self) -> None:
         self._freeze_cross_iter_movement = True
 
 
 class IterGraphModule(nn.Module):
-    """
-    ``IterGraphModule`` provides the ability to do cross-iteration optimization.
+    """``IterGraphModule`` provides the ability to do cross-iteration optimization.
+
     Given a ``fx.GraphModule``, main_gm, ``IterGraphModule`` internally
     duplicate it to 3 copies and redirect the ``forward`` request to a different
     ``fx.GraphModule`` based on the iteration count. This allows users to do
@@ -614,7 +645,12 @@ class IterGraphModule(nn.Module):
     data dependency for all 3 graphs.
     """
 
-    def __init__(self, main_gm: fx.GraphModule) -> None:
+    def __init__(
+        self,
+        main_gm: fx.GraphModule,
+        max_iters: int = -1,
+        enable_inductor: bool = False,
+    ) -> None:
         super().__init__()
 
         def _copy_gm(src: fx.GraphModule, graph: fx.Graph) -> fx.GraphModule:
@@ -630,32 +666,36 @@ class IterGraphModule(nn.Module):
         )
 
         self._iter = 0
-        self._max_iters = 0
+        self._max_iters = max_iters
         self._previous_output: Tuple[Any, ...] = tuple()
         self._num_extra_output = 0
+        self._is_frozen = False
+        self._enable_inductor = enable_inductor
 
-    def setup(self, max_iters: int = 0) -> None:
+    def finalize_setup(self) -> None:
+        """Set up the internal states and also get the signal from users that what is the maximum iteration count.
+
+        This method must be called before the forward() is called.
         """
-        This method is used to tell IterGraphModule the iterations to train so
-        that IterGraphModule knows which iteration is the last one and can do
-        proper cleanup.
-        """
-        # TODO: There are cases where max_iters is not known or not precise,
-        # e.g., data is depleted. One suggestion from the reviewer is to
-        # add one extra argument to forward(..., last_iter: bool = False) to
-        # allow users to tell us if the last iteration happens.
-        if max_iters <= 0:
-            raise ValueError(f"Incorrect max_iters is set, {max_iters}")
+        if not self._is_frozen:
+            self.graph.freeze_cross_iter_movement()
+            self._num_extra_output = self.graph.num_extra_output
+            if self._enable_inductor:
+                self.main_gm = partial_lower(self.main_gm)
+            self._is_frozen = True
+
         self._iter = 0
-        self._max_iters = max_iters
 
-    def _run(self, gm: fx.GraphModule, *args, **kwargs) -> Any:
+    def _run(self, gm: fx.GraphModule, last_iter: bool, *args, **kwargs) -> Any:
         if self._num_extra_output > 0:
             new_args = args + (self._previous_output)
             output = gm(*new_args, **kwargs)
-            if self._iter < self._max_iters:
+            if not last_iter:
                 assert len(output) == 2
                 self._previous_output = tuple(output[-1])
+                assert (
+                    len(self._previous_output) > 0
+                ), "There should be at least one extra output."
                 output = output[0]
         else:
             # No cross-iteration optimization is done. Simply call the
@@ -663,16 +703,18 @@ class IterGraphModule(nn.Module):
             output = gm(*args, **kwargs)
         return output
 
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
+    def forward(self, *args: Any, last_iter: bool = False, **kwargs: Any) -> Any:
         self._iter += 1
-        if self._iter == 1:
-            logger.info("Using the setup graph")
-            gm = self.setup_gm
-            profiler_string = "## IterGraphModule: Setup Graph ##"
-        elif self._iter == self._max_iters:
+        last_iter = last_iter or self._iter == self._max_iters
+        if last_iter:
             logger.info("Using the cleanup graph")
             gm = self.cleanup_gm
             profiler_string = "## IterGraphModule: Cleanup Graph ##"
+            self._iter = 0
+        elif self._iter == 1:
+            logger.info("Using the setup graph")
+            gm = self.setup_gm
+            profiler_string = "## IterGraphModule: Setup Graph ##"
         else:
             gm = self.main_gm
             if self._iter == 2:
@@ -682,7 +724,7 @@ class IterGraphModule(nn.Module):
                 profiler_string = "## IterGraphModule ##"
 
         with record_function(profiler_string):
-            return self._run(gm, *args, **kwargs)
+            return self._run(gm, last_iter, *args, **kwargs)
 
     @property
     def graph(self) -> IterGraph:
@@ -694,6 +736,7 @@ class IterGraphModule(nn.Module):
         return self.main_gm.recompile()
 
     def freeze_cross_iter_movement(self) -> None:
+        # TODO: remove this API once it is not used.
         self.graph.freeze_cross_iter_movement()
         self._num_extra_output = self.graph.num_extra_output
 

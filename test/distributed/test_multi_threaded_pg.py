@@ -1,5 +1,6 @@
 # Owner(s): ["oncall: distributed"]
 
+import os
 import sys
 import torch
 import torch.distributed as dist
@@ -8,6 +9,7 @@ from unittest import skip, SkipTest
 import operator
 from functools import reduce
 import threading
+import torch.autograd
 
 if not dist.is_available():
     print("Distributed not available, skipping tests", file=sys.stderr)
@@ -16,12 +18,14 @@ if not dist.is_available():
 from torch.testing._internal.common_distributed import (
     spawn_threads_and_init_comms,
     MultiThreadedTestCase,
+    skip_if_lt_x_gpu,
 )
 from torch.testing._internal.common_utils import (
     TestCase,
     run_tests,
     IS_SANDCASTLE,
 )
+
 
 DEFAULT_WORLD_SIZE = 4
 
@@ -95,8 +99,13 @@ class TestCollectivesWithBaseClass(MultiThreadedTestCase):
         return 4
 
     def setUp(self):
+        os.environ["TORCH_DIST_INIT_BARRIER"] = "1"
         super().setUp()
         self._spawn_threads()
+
+    def tearDown(self):
+        super().tearDown()
+        os.environ["TORCH_DIST_INIT_BARRIER"] = "0"
 
     def test_allgather(self):
         input_tensor = torch.ones(3, 3) * dist.get_rank()
@@ -128,6 +137,11 @@ class TestCollectivesWithBaseClass(MultiThreadedTestCase):
 
         dist.reduce_scatter(output_tensor, to_reduce_scatter)
         expected_tensor = torch.ones(3, 3) * dist.get_rank() * self.world_size
+        self.assertEqual(output_tensor, expected_tensor)
+
+        output_tensor = torch.empty(3, 3)
+        dist.reduce_scatter(output_tensor, to_reduce_scatter, op=dist.ReduceOp.AVG)
+        expected_tensor = torch.ones(3, 3) * dist.get_rank()
         self.assertEqual(output_tensor, expected_tensor)
 
     def test_broadcast_object_list(self):
@@ -234,6 +248,44 @@ class TestCollectivesWithBaseClass(MultiThreadedTestCase):
         if dist.get_rank() == 0:
             for i in range(self.world_size):
                 self.assertEqual(gather_list[i], torch.ones(3, 3) * i)
+
+    def test_all_reduce_coalesced(self):
+        t0 = torch.ones(3, 3) * dist.get_rank()
+        t1 = torch.ones(3, 3) * dist.get_rank() * 2
+        dist.all_reduce_coalesced([t0, t1])
+        res_num = ((0 + self.world_size - 1) * self.world_size) / 2
+        self.assertEqual(t0, torch.ones(3, 3) * res_num)
+        self.assertEqual(t1, torch.ones(3, 3) * (res_num * 2))
+
+    @skip_if_lt_x_gpu(1)
+    def test_bwd_sees_fwd_pg(self):
+        fwd_tid = threading.current_thread().ident
+
+        class MyFunc(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, rank):
+                result = rank * 2
+
+                ctx.save_for_backward(result, rank)
+                assert int(rank.item()) == dist.get_rank()
+                return result
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                result, rank = ctx.saved_tensors
+                bwd_tid = threading.current_thread().ident
+
+                self.assertEqual(fwd_tid, bwd_tid, f"bwd not running in the same thread a fwd for rank {rank.item()}")
+                self.assertTrue(dist.is_initialized())
+                self.assertEqual(int(rank.item()), dist.get_rank())
+                dist.all_reduce(result)
+                self.assertEqual(int(result.item()), 12)  # (0 + 1 + 2 + 3) * 2
+
+                return grad_output * result
+
+        x = torch.tensor([dist.get_rank()], dtype=torch.float, device="cuda", requires_grad=True)
+        x = MyFunc.apply(x)
+        x.sum().backward()
 
 if __name__ == "__main__":
     run_tests()

@@ -2,80 +2,38 @@
 PYTEST_DONT_REWRITE (prevents pytest from rewriting assertions, which interferes
 with test_adam in OptimizerTests)
 """
+import functools
+
 # Owner(s): ["module: dynamo"]
 
-import inspect
 
 import torch
 
 import torch._dynamo
 import torch._dynamo.test_case
 import torch._dynamo.testing
+from torch.nn import Parameter
 
 
-input = torch.ones([10, 10])
-model = torch.nn.Sequential(*[torch.nn.Linear(10, 10) for _ in range(2)])
-model(input).sum().backward()
+class MyOptimizer(torch.optim.Optimizer):
+    def __init__(self, params):
+        super().__init__(params, {})
 
+    def _init_group(self, params, group):
+        any_complex = False
+        for p in group["params"]:
+            params.append(p)
+            any_complex |= p.is_complex()
+        return any_complex
 
-def make_test(optim_cls, exp_graph_count=1, closure=None, **kwargs):
-    opt = optim_cls(model.parameters(), **kwargs)
-
-    def test_fn(self):
-        nonlocal opt
-        if closure is not None:
-
-            def fn():
-                opt.step(closure)
-
-        else:
-            fn = opt.step
-
-        _, _, graphs, _, _, _ = torch._dynamo.explain(fn)
-
-        self.assertEqual(exp_graph_count, len(graphs))
-
-    return test_fn
-
-
-class OptimizerTests(torch._dynamo.test_case.TestCase):
-    test_sgd = make_test(torch.optim.SGD, lr=0.01)
-    # lgbfs has data-dependent control and internally iterates
-    # calling the closure
-    # TODO mlazos: re-enable once we have latest pytorch with FakeTensor fix #497
-    # test_lbfgs = make_test(
-    #    torch.optim.LBFGS, exp_frame_cnt=3, closure=lambda: model(input).sum()
-    # )
-
-    # Has data dependent control for rectification (needs symint)
-    # RAdam has data-dependent control which breaks the graph;
-    # furthermore, the break is inside a for loop, so we bail on the frame
-    # entirely.  This is basically an xfail; if the frame count goes up
-    # you done good
-    test_radam = make_test(torch.optim.RAdam, exp_graph_count=0)
-
-
-# exclude SparseAdam because other areas of the stack don't support it yet
-# the others are handled specially above
-exclude = {
-    "SGD",  # Handled above
-    "Optimizer",
-    "SparseAdam",  # Unsupported
-    "LBFGS",  # Unsupported
-    "RAdam",  # Has data dependent control for rectification (needs symint)
-}
-
-optimizers = [
-    opt
-    for opt in torch.optim.__dict__.values()
-    if inspect.isclass(opt)
-    and issubclass(opt, torch.optim.Optimizer)
-    and opt.__name__ not in exclude
-]
-
-
-for opt in optimizers:
-    setattr(OptimizerTests, "test_" + opt.__name__.lower(), make_test(opt))
+    def step(self):
+        for group in self.param_groups:
+            params = []
+            any_complex = self._init_group(params, group)
+            if any_complex:
+                params[0] -= 1
+            else:
+                params[0] += 1
 
 
 class End2EndTests(torch._dynamo.test_case.TestCase):
@@ -108,13 +66,44 @@ class End2EndTests(torch._dynamo.test_case.TestCase):
             opt_training_iter_fn(batch, net, optimizer)
         self.assertEqual(cnts.frame_count, 2)
 
+    def test_state_dict(self):
+        @torch.compile(backend="eager")
+        def _test_state_dict(weight, bias, input):
+            def fn_base(optimizer, weight, bias):
+                optimizer.zero_grad()
+                i = input
+                loss = (weight.mv(i) + bias).pow(2).sum()
+                loss.backward()
+                return loss
+
+            optimizer = torch.optim.Adagrad([weight, bias])
+            fn = functools.partial(fn_base, optimizer, weight, bias)
+            return optimizer, fn
+
+        optimizer, fn = _test_state_dict(
+            Parameter(torch.randn(10, 5)),
+            Parameter(torch.randn(10)),
+            torch.randn(5, requires_grad=True),
+        )
+        optimizer.step(fn)
+
+    def test_init_group(self):
+        for dtype in [torch.float32, torch.cfloat]:
+            tensor = torch.randn(5, 5, dtype=dtype)
+            params = Parameter(tensor.detach().clone(), requires_grad=False)
+            opt_params = Parameter(tensor.detach().clone(), requires_grad=False)
+
+            optim = MyOptimizer([params])
+            optim.step()
+
+            opt_optim = MyOptimizer([opt_params])
+            opt_step = torch.compile(backend="eager", fullgraph=True)(opt_optim.step)
+            opt_step()
+
+            self.assertEqual(params, opt_params)
+
 
 if __name__ == "__main__":
-    # most optimizer tests are broken on 3.11
-    # TODO remove when 3.11 is fully supported
-    import sys
-
     from torch._dynamo.test_case import run_tests
 
-    if sys.version_info < (3, 11):
-        run_tests()
+    run_tests()

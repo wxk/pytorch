@@ -188,7 +188,11 @@ from torch.testing._internal.common_quantized import (
     override_quantized_engine,
 )
 
-from torch.testing._internal.common_utils import TemporaryFileName, IS_ARM64
+from torch.testing._internal.common_utils import (
+    TemporaryFileName,
+    IS_ARM64,
+    skipIfTorchDynamo,
+)
 
 from torch.testing._internal.common_quantization import NodeSpec as ns
 
@@ -2505,7 +2509,7 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(len(qconfig_mapping.module_name_object_type_order_qconfigs), 2)
         key1 = ("mod1", torch.nn.Linear, 0)
         key2 = ("mod2", torch.nn.ReLU, 1)
-        self.assertEqual(list(qconfig_mapping.module_name_object_type_order_qconfigs)[0], key1)
+        self.assertEqual(next(iter(qconfig_mapping.module_name_object_type_order_qconfigs)), key1)
         self.assertEqual(list(qconfig_mapping.module_name_object_type_order_qconfigs)[1], key2)
         self.assertEqual(qconfig_mapping.module_name_object_type_order_qconfigs[key1], qconfig1)
         self.assertEqual(qconfig_mapping.module_name_object_type_order_qconfigs[key2], qconfig2)
@@ -2516,7 +2520,7 @@ class TestQuantizeFx(QuantizationTestCase):
         # Override existing key
         qconfig_mapping.set_module_name_object_type_order("mod1", torch.nn.Linear, 0, qconfig3)
         self.assertEqual(len(qconfig_mapping.module_name_object_type_order_qconfigs), 2)
-        self.assertEqual(list(qconfig_mapping.module_name_object_type_order_qconfigs)[0], key1)
+        self.assertEqual(next(iter(qconfig_mapping.module_name_object_type_order_qconfigs)), key1)
         self.assertEqual(list(qconfig_mapping.module_name_object_type_order_qconfigs)[1], key2)
         self.assertEqual(qconfig_mapping.module_name_object_type_order_qconfigs[key1], qconfig3)
         self.assertEqual(qconfig_mapping.module_name_object_type_order_qconfigs[key2], qconfig2)
@@ -2557,7 +2561,7 @@ class TestQuantizeFx(QuantizationTestCase):
         }
 
         with self.assertRaises(ValueError) as context:
-            m = prepare_fx(m, qconfig_dict, example_inputs=(torch.randn(1, 3, 3, 3),))
+            m = prepare_fx(m, qconfig_dict, example_inputs=(torch.randn(1, 3, 3, 3),))  # noqa: F821
         self.assertTrue(
             'Expected qconfig_dict to have the following keys:' in str(context.exception)
         )
@@ -3913,9 +3917,7 @@ class TestQuantizeFx(QuantizationTestCase):
             elif arg_node.op == "call_module":
                 self.assertTrue(
                     not _is_activation_post_process(getattr(model, arg_node.target)),
-                    "Arg: {0} of node: {1} is observed but is not a float tensor".format(
-                        arg_node, node
-                    ),
+                    f"Arg: {arg_node} of node: {node} is observed but is not a float tensor",
                 )
 
         for node in model.graph.nodes:
@@ -4991,7 +4993,7 @@ class TestQuantizeFx(QuantizationTestCase):
                 continue
             matched_names.add(node.name)
             # Match preceding dequantize
-            self.assertTrue(all([arg.target == "dequantize" for arg in node.args]))
+            self.assertTrue(all(arg.target == "dequantize" for arg in node.args))
             # Match following quantize with the specific qparams and dtypes
             expected_scale, expected_zp, expected_dtype = node_name_to_expected_quantize_args[node.name]
             for user in node.users.keys():
@@ -5516,19 +5518,19 @@ class TestQuantizeFx(QuantizationTestCase):
         self.addCleanup(cleanUp)
 
         @_register_fusion_pattern("dummy_fusion")
-        class DummyFusion():
+        class DummyFusion:
             pass
 
         @_register_quant_pattern("dummy_quant")
-        class DummyQuant():
+        class DummyQuant:
             pass
 
         @_register_quant_pattern("dummy_quant2", default_fixed_qparams_range_0to1_observer)
-        class DummyQuant2():
+        class DummyQuant2:
             pass
 
         @_register_quant_pattern("dummy_quant3", default_fixed_qparams_range_neg1to1_observer)
-        class DummyQuant3():
+        class DummyQuant3:
             pass
 
         self.assertEqual(_DEFAULT_FUSION_PATTERNS["dummy_fusion"], DummyFusion)
@@ -6083,8 +6085,8 @@ class TestQuantizeFx(QuantizationTestCase):
         m_ref = convert_to_reference_fx(m_ref)
         m = _convert_to_reference_decomposed_fx(m)
         expected_occurrence = {
-            ns.call_function(torch.ops.quantized_decomposed.quantize_per_tensor): 2,
-            ns.call_function(torch.ops.quantized_decomposed.dequantize_per_tensor): 2,
+            ns.call_function(torch.ops.quantized_decomposed.quantize_per_tensor.default): 2,
+            ns.call_function(torch.ops.quantized_decomposed.dequantize_per_tensor.default): 2,
         }
         self.checkGraphModuleNodes(
             m,
@@ -6144,11 +6146,11 @@ class TestQuantizeFx(QuantizationTestCase):
         m = _convert_to_reference_decomposed_fx(m)
         expected_occurrence = {
             # for input and output activations
-            ns.call_function(torch.ops.quantized_decomposed.quantize_per_tensor): 2,
-            ns.call_function(torch.ops.quantized_decomposed.dequantize_per_tensor): 2,
+            ns.call_function(torch.ops.quantized_decomposed.quantize_per_tensor.default): 2,
+            ns.call_function(torch.ops.quantized_decomposed.dequantize_per_tensor.default): 2,
             # for weight
-            ns.call_function(torch.ops.quantized_decomposed.quantize_per_channel): 1,
-            ns.call_function(torch.ops.quantized_decomposed.dequantize_per_channel): 1,
+            ns.call_function(torch.ops.quantized_decomposed.quantize_per_channel.default): 1,
+            ns.call_function(torch.ops.quantized_decomposed.dequantize_per_channel.default): 1,
         }
         self.checkGraphModuleNodes(
             m,
@@ -6510,11 +6512,11 @@ class TestQuantizeFx(QuantizationTestCase):
 
             # Match preceding dequantize
             self.assertTrue(len(node.args) == 1 or len(node.args) == 2)
-            self.assertTrue(all([arg.target == "dequantize" for arg in node.args]))
+            self.assertTrue(all(arg.target == "dequantize" for arg in node.args))
 
             # Match following quantize with the specific dtypes
             self.assertEqual(len(node.users), 1)
-            user = list(node.users.keys())[0]
+            user = next(iter(node.users.keys()))
             self.assertEqual(user.target, torch.quantize_per_tensor)
             self.assertEqual(user.args[-1], target_to_expected_dtypes[node.target])
 
@@ -8301,7 +8303,7 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 self.avg_pool1d = torch.nn.AvgPool1d(3)
                 self.avg_pool2d = torch.nn.AvgPool2d(3)
                 self.avg_pool3d = torch.nn.AvgPool3d(3)
-                self.adaptive_avg_pool1d = torch.nn.AdaptiveAvgPool1d((1))
+                self.adaptive_avg_pool1d = torch.nn.AdaptiveAvgPool1d(1)
                 self.adaptive_avg_pool2d = torch.nn.AdaptiveAvgPool2d((1, 1))
                 self.adaptive_avg_pool3d = torch.nn.AdaptiveAvgPool3d((1, 1, 1))
 
@@ -8635,12 +8637,24 @@ class TestQuantizeFxOps(QuantizationTestCase):
             indices = torch.tensor([9, 6, 5, 7, 8, 8, 9, 2, 8, 6, 6, 9, 1, 6, 8, 8, 3, 2, 3, 6, 3, 6, 5, 7, 0, 8, 4, 6, 5, 8, 2, 3])
             example_inputs = (indices,)
             quantized_node = ns.call_module(nnq.Embedding)
+
+            # check dynamic quant
+            self.checkGraphModeFxOp(
+                model,
+                example_inputs,
+                QuantType.DYNAMIC,
+                quantized_node,
+                custom_qconfig_dict={"": qconfig_type}
+            )
+            model = M().eval()
+
             configs = [
                 (qconfig_type, ns.call_module(nnq.Embedding)),
                 (None, ns.call_module(nn.Embedding)),
                 (default_qconfig, ns.call_module(nn.Embedding)),
             ]
 
+            # check static quantization
             for qconfig, node in configs:
                 qconfig_dict = {"": qconfig}
                 m = prepare_fx(model, qconfig_dict, example_inputs=example_inputs)
@@ -8704,7 +8718,7 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 continue
                 # fp16 dynamic quant is not supported for qnnpack
 
-            eager_qconfig_dict = {x : qconfig for x in module_types}
+            eager_qconfig_dict = dict.fromkeys(module_types, qconfig)
             model_eager = quantize_dynamic(model_eager, qconfig_spec=eager_qconfig_dict)
 
             graph_qconfig_dict = {
@@ -9008,6 +9022,43 @@ class TestQuantizeFxOps(QuantizationTestCase):
         }
         self.checkGraphModuleNodes(m, expected_node_occurrence=expected_occurrence)
 
+    def test_pixel_shuffle_module(self) -> None:
+        class MyBias(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bias = nn.Parameter(torch.randn(8))
+
+        class MyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(8, 8, 1, bias=False)
+                self.ps = nn.PixelShuffle(upscale_factor=2)
+                self.bias = MyBias()
+
+            def forward(self, x):
+                x = self.conv(x)
+                x = self.ps(x)
+                x = x.view(-1, 8, 2, 2)
+                bias = self.bias.bias
+                return x + bias
+
+        backend_config = get_qnnpack_backend_config()
+        qconfig_mapping = get_default_qconfig_mapping("qnnpack")
+        model = MyModel()
+        m = prepare_fx(
+            model,
+            qconfig_mapping=qconfig_mapping,
+            example_inputs=(torch.randn(1, 8, 3, 3),),
+            backend_config=backend_config
+        )
+        m = convert_fx(m)
+        expected_occurrence = {
+            ns.call_function(torch.quantize_per_tensor): 2,
+            ns.call_method("dequantize"): 1,
+            ns.call_module(nn.PixelShuffle): 1,
+        }
+        self.checkGraphModuleNodes(m, expected_node_occurrence=expected_occurrence)
+
     def test_pixel_unshuffle(self):
         class MyBias(nn.Module):
             def __init__(self):
@@ -9043,6 +9094,46 @@ class TestQuantizeFxOps(QuantizationTestCase):
             expected_occurrence = {
                 ns.call_function(torch.quantize_per_tensor): 2,
                 ns.call_method("dequantize"): 1,
+            }
+            self.checkGraphModuleNodes(m, expected_node_occurrence=expected_occurrence)
+
+    def test_pixel_unshuffle_module(self) -> None:
+        class MyBias(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bias = nn.Parameter(torch.randn(64))
+
+        class MyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(8, 8, 1, bias=False)
+                self.unshuffle = nn.PixelUnshuffle(downscale_factor=2)
+                self.bias = MyBias()
+
+            def forward(self, x):
+                x = self.conv(x)
+                x = self.unshuffle(x)
+                bias = self.bias.bias
+                return x + bias
+
+        for backend in ["fbgemm", "qnnpack"]:
+            if backend == "fbgemm":
+                backend_config = get_fbgemm_backend_config()
+            else:
+                backend_config = get_qnnpack_backend_config()
+            qconfig_mapping = get_default_qconfig_mapping(backend)
+            model = MyModel()
+            m = prepare_fx(
+                model,
+                qconfig_mapping=qconfig_mapping,
+                example_inputs=(torch.randn(1, 8, 6, 6),),
+                backend_config=backend_config
+            )
+            m = convert_fx(m)
+            expected_occurrence = {
+                ns.call_function(torch.quantize_per_tensor): 2,
+                ns.call_method("dequantize"): 1,
+                ns.call_module(nn.PixelUnshuffle): 1,
             }
             self.checkGraphModuleNodes(m, expected_node_occurrence=expected_occurrence)
 
@@ -9171,6 +9262,7 @@ class TestQuantizeFxModels(QuantizationTestCase):
                 out = model_quantized(input.to(device_after))
                 self.assertEqual(out.device.type, device_after)
 
+    @skipIfTorchDynamo("too slow")
     @skip_if_no_torchvision
     def test_model_dropout(self):
         from torchvision import models
@@ -9225,8 +9317,8 @@ class TestQuantizeFxModels(QuantizationTestCase):
 
         if mode == 'ddp':
             mp.spawn(run_ddp,
-                     args=(world_size, prepared),
-                     nprocs=world_size,
+                     args=(world_size, prepared),  # noqa: F821
+                     nprocs=world_size,  # noqa: F821
                      join=True)
         elif mode == 'qat':
             assert prepared.training, 'prepared must be in training mode for qat'
@@ -9271,8 +9363,8 @@ class TestQuantizeFxModels(QuantizationTestCase):
             # calibration
             if mode == 'ddp':
                 mp.spawn(run_ddp,
-                         args=(world_size, qeager),
-                         nprocs=world_size,
+                         args=(world_size, qeager),  # noqa: F821
+                         nprocs=world_size,  # noqa: F821
                          join=True)
             elif mode == 'qat':
                 assert qeager.training, 'qeager should be in training mode for qat'
@@ -9436,8 +9528,8 @@ class TestQuantizeFxModels(QuantizationTestCase):
     def test_resnet18_ddp(self):
         from torchvision import models
         from torchvision.models import quantization as quantized_models
-        eager_quantizable_model = quantized_models.__dict__[name](pretrained=False, quantize=False).eval().float()
-        model = models.__dict__[name](pretrained=False).eval().float()
+        eager_quantizable_model = quantized_models.__dict__[name](pretrained=False, quantize=False).eval().float()  # noqa: F821
+        model = models.__dict__[name](pretrained=False).eval().float()  # noqa: F821
         self._test_model_impl(
             'ddp', 'resnet18', model, eager_quantizable_model)
 

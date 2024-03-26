@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Owner(s): ["module: unknown"]
 
 from torch.testing._internal.common_utils import run_tests
@@ -13,7 +12,7 @@ import torch
 import torch.ao.quantization as tq
 
 from torch import nn
-from torch.ao.pruning.pruner.utils import fqn_to_module
+from torch.ao.pruning.sparsifier.utils import fqn_to_module
 
 from torch.testing._internal.common_utils import TestCase, skipIfTorchDynamo
 from torch.testing._internal.common_quantized import (

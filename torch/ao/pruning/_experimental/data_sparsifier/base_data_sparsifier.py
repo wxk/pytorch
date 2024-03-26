@@ -1,11 +1,11 @@
 import abc
 import torch
 from typing import Optional, Tuple, List, Any, Dict
-from ...pruner.base_pruner import BasePruner
+from ...sparsifier import base_sparsifier
 from collections import defaultdict
 from torch import nn
 import copy
-from ...pruner import utils
+from ...sparsifier import utils
 from torch.nn.utils import parametrize
 import sys
 import warnings
@@ -32,7 +32,7 @@ class _Container(nn.Module):
     pass
 
 
-class BaseDataSparsifier(BasePruner):
+class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
     r"""
     Base Data Sparsifier class for all Data sparsifiers.
     The abstract class accepts raw torch tensors / embedding / embedding bags (refer to SUPPORTED_TYPES above)
@@ -144,7 +144,7 @@ class BaseDataSparsifier(BasePruner):
         r"""Converts the mask to sparse coo or dense tensors depending on the `sparse_coo` argument.
         """
         states = copy.deepcopy(states)
-        for _, state in states.items():
+        for state in states.values():
             if sparse_coo:
                 state['mask'] = state['mask'].to_sparse_coo()
             else:

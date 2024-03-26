@@ -1,11 +1,21 @@
 //  Copyright © 2022 Apple Inc.
-
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/mps/IndexKernels.h>
 #include <ATen/mps/MPSAllocatorInterface.h>
+#include <ATen/mps/MPSProfiler.h>
 #include <ATen/native/Resize.h>
+// For MTLLanguageVersion_3_1
+#include <ATen/native/mps/MPSGraphSonomaOps.h>
 #include <ATen/native/mps/OperationUtils.h>
 #include <fmt/format.h>
-#include <torch/library.h>
+
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/as_strided_native.h>
+#include <ATen/ops/view_as_real.h>
+#endif
 
 namespace at::native {
 namespace mps {
@@ -83,13 +93,13 @@ static Tensor& runViewGraph(ViewCachedGraph* cachedGraph, const at::Tensor& src,
     MPSGraphTensorData* outputTensorData = [[[MPSGraphTensorData alloc] initWithMTLBuffer:outputBuffer
                                                                                     shape:outputShape
                                                                                  dataType:outputType] autorelease];
-    NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* results = @{cachedGraph->outputTensor : outputTensorData};
+    auto results = @{cachedGraph->outputTensor : outputTensorData};
     runMPSGraph(stream, cachedGraph->graph(), feeds, results);
   }
   return output;
 }
 
-MPSGraphTensor* permuteTensor(MPSGraph* graph, MPSGraphTensor* inputTensor, NSArray* permuteOrder) {
+static MPSGraphTensor* permuteTensor(MPSGraph* graph, MPSGraphTensor* inputTensor, NSArray* permuteOrder) {
   NSUInteger srcRank = [[inputTensor shape] count];
   if (srcRank != [permuteOrder count]) {
     return nil;
@@ -112,7 +122,7 @@ MPSGraphTensor* permuteTensor(MPSGraph* graph, MPSGraphTensor* inputTensor, NSAr
   return outputTensor;
 }
 
-NSDictionary* getStrideToDimLengthOffsetDict(MPSGraphTensor* tensor, NSUInteger rank, NSUInteger offset) {
+static NSDictionary* getStrideToDimLengthOffsetDict(MPSGraphTensor* tensor, NSUInteger rank, NSUInteger offset) {
   // Assuming input tensor has default strides
   NSInteger stride = 1;
   NSMutableDictionary* strideToDimLengthOffset = [[NSMutableDictionary alloc] init];
@@ -131,12 +141,12 @@ NSDictionary* getStrideToDimLengthOffsetDict(MPSGraphTensor* tensor, NSUInteger 
 }
 
 // Detect only expand dims, allows for duplicate strides
-MPSGraphTensor* asStridedLayer_expandDimsPattern(MPSGraph* graph,
-                                                 MPSGraphTensor* inputTensor,
-                                                 size_t dstRank,
-                                                 const IntArrayRef& dstSizes,
-                                                 const IntArrayRef& dstStrides,
-                                                 int offset) {
+static MPSGraphTensor* asStridedLayer_expandDimsPattern(MPSGraph* graph,
+                                                        MPSGraphTensor* inputTensor,
+                                                        size_t dstRank,
+                                                        const IntArrayRef& dstSizes,
+                                                        const IntArrayRef& dstStrides,
+                                                        int offset) {
   NSUInteger srcRank = [[inputTensor shape] count];
   // Not an expand dims
   if (srcRank >= dstRank)
@@ -183,12 +193,12 @@ MPSGraphTensor* asStridedLayer_expandDimsPattern(MPSGraph* graph,
 }
 
 // Detect contiguous reshapes, no slicing
-MPSGraphTensor* asStridedLayer_reshapePattern(MPSGraph* graph,
-                                              MPSGraphTensor* inputTensor,
-                                              size_t dstRank,
-                                              const IntArrayRef& dstSizes,
-                                              const IntArrayRef& dstStrides,
-                                              int offset) {
+static MPSGraphTensor* asStridedLayer_reshapePattern(MPSGraph* graph,
+                                                     MPSGraphTensor* inputTensor,
+                                                     size_t dstRank,
+                                                     const IntArrayRef& dstSizes,
+                                                     const IntArrayRef& dstStrides,
+                                                     int offset) {
   NSUInteger srcRank = [[inputTensor shape] count];
   // Not a reshape
   if (srcRank <= dstRank)
@@ -226,12 +236,12 @@ MPSGraphTensor* asStridedLayer_reshapePattern(MPSGraph* graph,
   return outputTensor;
 }
 
-MPSGraphTensor* asStridedLayer_genericPattern(MPSGraph* graph,
-                                              MPSGraphTensor* inputTensor,
-                                              size_t dstRank,
-                                              const IntArrayRef& dstSizes,
-                                              const IntArrayRef& dstStrides,
-                                              int offset) {
+static MPSGraphTensor* asStridedLayer_genericPattern(MPSGraph* graph,
+                                                     MPSGraphTensor* inputTensor,
+                                                     size_t dstRank,
+                                                     const IntArrayRef& dstSizes,
+                                                     const IntArrayRef& dstStrides,
+                                                     int offset) {
   // Duplicate strides cannot be done
   {
     BOOL allUnique = YES;
@@ -406,12 +416,12 @@ MPSGraphTensor* asStridedLayer_genericPattern(MPSGraph* graph,
   return broadcastTensor;
 }
 
-MPSGraphTensor* asStridedLayer_pattern(MPSGraph* graph,
-                                       MPSGraphTensor* inputTensor,
-                                       size_t dstRank,
-                                       const IntArrayRef& dstSizes,
-                                       const IntArrayRef& dstStrides,
-                                       int offset) {
+static MPSGraphTensor* asStridedLayer_pattern(MPSGraph* graph,
+                                              MPSGraphTensor* inputTensor,
+                                              size_t dstRank,
+                                              const IntArrayRef& dstSizes,
+                                              const IntArrayRef& dstStrides,
+                                              int offset) {
   if (!dstRank)
     return nil;
 
@@ -460,7 +470,7 @@ static std::vector<int64_t> getViewShape(const Tensor& src, MPSShape* mpsShape, 
   return src_view_shape;
 }
 
-std::vector<int64_t> getSqueezedBaseShape(const Tensor& src, IntArrayRef shape) {
+static std::vector<int64_t> getSqueezedBaseShape(const Tensor& src, IntArrayRef shape) {
   std::vector<int64_t> src_base_shape;
   for (const auto i : c10::irange(shape.size())) {
     if (shape[i] == 1)
@@ -682,47 +692,35 @@ static ViewCachedGraph* createViewGraph(const Tensor& self,
   @autoreleasepool {
     string key = getStridedKey(
         self.scalar_type(), updates.scalar_type(), base_shape, size, stride, storage_offset, needsScatter);
-    MPSGraphCache* cache_ = MPSGraphCache::getInstance();
-    ViewCachedGraph* cachedGraph = static_cast<ViewCachedGraph*>(cache_->LookUp(key));
+    return LookUpOrCreateCachedGraph<ViewCachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
+      MPSGraphTensor* updatesTensor = nil;
+      // Workaround for MPSShaderLibrary bug in macOS Monterey
+      // This is fixed in macOS Ventura
+      auto inputType = getMPSScalarType(self.scalar_type());
+      if (inputType == MPSDataTypeUInt8 || (inputType == MPSDataTypeBool && !is_macos_13_or_newer())) {
+        inputType = MPSDataTypeInt8;
+      }
 
-    if (!cachedGraph) {
-      cachedGraph = static_cast<ViewCachedGraph*>(cache_->CreateCachedGraph(key, ^MPSCachedGraph*() {
-        ViewCachedGraph* newCachedGraph = nil;
-        @autoreleasepool {
-          MPSGraph* mpsGraph = make_mps_graph();
-          MPSGraphTensor* updatesTensor = nil;
-          newCachedGraph = new ViewCachedGraph(mpsGraph);
-          // Workaround for MPSShaderLibrary bug in macOS Monterey
-          // This is fixed in macOS Ventura
-          auto inputType = getMPSScalarType(self.scalar_type());
-          if (inputType == MPSDataTypeUInt8 || (inputType == MPSDataTypeBool && !is_macos_13_or_newer())) {
-            inputType = MPSDataTypeInt8;
-          }
-
-          // Self is the input tensor we are creating view of
-          newCachedGraph->inputTensor = mpsGraphRankedPlaceHolder(mpsGraph, inputType, getMPSShape(base_shape));
-          newCachedGraph->storageOffsetTensor = mpsGraphRankedPlaceHolder(mpsGraph, MPSDataTypeInt32, @[ @1 ]);
-          for (const auto C10_UNUSED i : c10::irange(size.size())) {
-            newCachedGraph->strideTensors.push_back(mpsGraphRankedPlaceHolder(mpsGraph, MPSDataTypeInt32, @[ @1 ]));
-          }
-          if (needsScatter) {
-            auto updatesType = getMPSScalarType(updates.scalar_type());
-            if (updatesType == MPSDataTypeUInt8 || (updatesType == MPSDataTypeBool && !is_macos_13_or_newer())) {
-              updatesType = MPSDataTypeInt8;
-            }
-            newCachedGraph->updatesTensor = mpsGraphRankedPlaceHolder(mpsGraph, updatesType, getMPSShape(self.numel()));
-            updatesTensor = newCachedGraph->updatesTensor;
-            if (inputType != updatesType) {
-              updatesTensor = [mpsGraph castTensor:updatesTensor toType:inputType name:@"castUpdatesTensor"];
-            }
-          }
-          newCachedGraph->outputTensor =
-              chainViewOperation(newCachedGraph, size, stride, storage_offset, base_shape, needsScatter, updatesTensor);
+      // Self is the input tensor we are creating view of
+      newCachedGraph->inputTensor = mpsGraphRankedPlaceHolder(mpsGraph, inputType, getMPSShape(base_shape));
+      newCachedGraph->storageOffsetTensor = mpsGraphRankedPlaceHolder(mpsGraph, MPSDataTypeInt32, @[ @1 ]);
+      for (const auto C10_UNUSED i : c10::irange(size.size())) {
+        newCachedGraph->strideTensors.push_back(mpsGraphRankedPlaceHolder(mpsGraph, MPSDataTypeInt32, @[ @1 ]));
+      }
+      if (needsScatter) {
+        auto updatesType = getMPSScalarType(updates.scalar_type());
+        if (updatesType == MPSDataTypeUInt8 || (updatesType == MPSDataTypeBool && !is_macos_13_or_newer())) {
+          updatesType = MPSDataTypeInt8;
         }
-        return newCachedGraph;
-      }));
-    }
-    return cachedGraph;
+        newCachedGraph->updatesTensor = mpsGraphRankedPlaceHolder(mpsGraph, updatesType, getMPSShape(self.numel()));
+        updatesTensor = newCachedGraph->updatesTensor;
+        if (inputType != updatesType) {
+          updatesTensor = [mpsGraph castTensor:updatesTensor toType:inputType name:@"castUpdatesTensor"];
+        }
+      }
+      newCachedGraph->outputTensor =
+          chainViewOperation(newCachedGraph, size, stride, storage_offset, base_shape, needsScatter, updatesTensor);
+    });
   }
 }
 
@@ -731,17 +729,20 @@ static std::string getGatherScatterFunctionName(ScalarType scalarType, int64_t d
   return kernelName + "_kernel_" + std::to_string(dim == 0 ? 1 : dim);
 }
 
-const std::string& getGatherScatterScalarType(const Tensor& t) {
+static const std::string& getGatherScatterScalarType(const Tensor& t) {
   auto scalar_type = t.scalar_type();
   static std::unordered_map<c10::ScalarType, std::string> scalarToMetalType = {
       {c10::ScalarType::Float, "float"},
       {c10::ScalarType::Half, "half"},
+      {c10::ScalarType::BFloat16, "bfloat"},
       {c10::ScalarType::Long, "long"},
       {c10::ScalarType::Int, "int"},
       {c10::ScalarType::Short, "short"},
       {c10::ScalarType::Char, "char"},
       {c10::ScalarType::Byte, "uchar"},
       {c10::ScalarType::Bool, "bool"},
+      {c10::ScalarType::ComplexFloat, "float2"},
+      {c10::ScalarType::ComplexHalf, "half2"},
   };
 
   auto it = scalarToMetalType.find(scalar_type);
@@ -749,11 +750,32 @@ const std::string& getGatherScatterScalarType(const Tensor& t) {
   return it->second;
 }
 
+static std::string genScatterGatherCvtFunc(const std::string& dtypeSrc, const std::string& dtypeDst, bool needsConj) {
+  const bool srcComplex = dtypeSrc[dtypeSrc.size() - 1] == '2';
+  const bool dstComplex = dtypeDst[dtypeDst.size() - 1] == '2';
+  if (dstComplex) {
+    return dtypeDst + (srcComplex ? needsConj ? "(x.x, -x.y)" : "(x.x, x.y)" : "(x,  0.0)");
+  }
+  if (srcComplex) {
+    // TODO: Document why explicit cast is needed only for bfloat types
+    if (dtypeDst == "bfloat") {
+      return "bfloat(x.x)";
+    }
+    return "x.x";
+  }
+  // TODO: Document why explicit cast is needed only for bfloat types
+  if (dtypeDst == "bfloat") {
+    return "bfloat(x)";
+  }
+  return "(x)";
+}
+
 static id<MTLLibrary> compileGatherScatterOpsLibrary(id<MTLDevice> device,
                                                      const std::string& dtypeSrc,
                                                      const std::string& dtypeDst,
-                                                     bool needsScatter) {
-  auto key = std::to_string(needsScatter) + dtypeSrc + dtypeDst;
+                                                     bool needsScatter,
+                                                     bool needsConj) {
+  auto key = std::to_string(needsScatter) + std::to_string(needsConj) + dtypeSrc + dtypeDst;
   static std::unordered_map<std::string, id<MTLLibrary>> _libCache;
   auto it = _libCache.find(key);
   if (it != _libCache.end()) {
@@ -761,15 +783,15 @@ static id<MTLLibrary> compileGatherScatterOpsLibrary(id<MTLDevice> device,
   }
   NSError* error = nil;
   MTLCompileOptions* options = [[MTLCompileOptions new] autorelease];
-  [options setLanguageVersion:MTLLanguageVersion2_3];
-  auto gatherScatterLib =
-      [device newLibraryWithSource:[NSString stringWithUTF8String:fmt::format(needsScatter ? SCATTER_OPS_TEMPLATE
-                                                                                           : GATHER_OPS_TEMPLATE,
-                                                                              dtypeSrc,
-                                                                              dtypeDst)
-                                                                      .c_str()]
-                           options:options
-                             error:&error];
+  [options setLanguageVersion:is_macos_13_or_newer(MacOSVersion::MACOS_VER_14_0_PLUS) ? MTLLanguageVersion3_1
+                                                                                      : MTLLanguageVersion2_3];
+  const auto shaderStr = fmt::format(needsScatter ? SCATTER_OPS_TEMPLATE : GATHER_OPS_TEMPLATE,
+                                     dtypeSrc,
+                                     dtypeDst,
+                                     genScatterGatherCvtFunc(dtypeSrc, dtypeDst, needsConj));
+  auto gatherScatterLib = [device newLibraryWithSource:[NSString stringWithUTF8String:shaderStr.c_str()]
+                                               options:options
+                                                 error:&error];
   TORCH_CHECK(gatherScatterLib != nil && error == nil,
               "Failed to compile gather-scatter library, error: ",
               [[error description] UTF8String]);
@@ -781,8 +803,9 @@ static id<MTLComputePipelineState> getPipelineState(id<MTLDevice> device,
                                                     const std::string& kernel,
                                                     const std::string& dtypeSrc,
                                                     const std::string& dtypeDst,
-                                                    bool needsScatter) {
-  auto key = kernel + dtypeSrc + dtypeDst;
+                                                    bool needsScatter,
+                                                    bool needsConj) {
+  auto key = kernel + dtypeSrc + dtypeDst + std::to_string(needsConj);
   static std::unordered_map<std::string, id<MTLComputePipelineState>> _mtlPipelineCache;
   auto it = _mtlPipelineCache.find(key);
   if (it != _mtlPipelineCache.end()) {
@@ -790,7 +813,7 @@ static id<MTLComputePipelineState> getPipelineState(id<MTLDevice> device,
   }
 
   NSError* error = nil;
-  id<MTLLibrary> library = compileGatherScatterOpsLibrary(device, dtypeSrc, dtypeDst, needsScatter);
+  id<MTLLibrary> library = compileGatherScatterOpsLibrary(device, dtypeSrc, dtypeDst, needsScatter, needsConj);
   id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithUTF8String:kernel.c_str()]];
   TORCH_CHECK(func, "Failed to load the Metal Shader function: ", kernel);
   id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:func error:&error];
@@ -803,7 +826,7 @@ static id<MTLComputePipelineState> getPipelineState(id<MTLDevice> device,
 Tensor gatherViewTensor(const at::Tensor& src, at::Tensor& dst) {
   Tensor output = dst;
   if (!dst.has_storage()) {
-    output = at::native::empty_mps(src.sizes(), src.scalar_type(), c10::nullopt, kMPS);
+    output = at::empty(src.sizes(), src.scalar_type(), c10::nullopt, kMPS, c10::nullopt, c10::nullopt);
   }
 
   if (src.numel() == 0 || output.numel() == 0) {
@@ -816,19 +839,21 @@ Tensor gatherViewTensor(const at::Tensor& src, at::Tensor& dst) {
     return runViewGraph(cachedGraph, src, dst.has_storage() ? dst : output, /*needsScatter*/ false);
   }
 
-  id<MTLBuffer> outputBuffer = dst.has_storage() ? getMTLBufferStorage(dst) : getMTLBufferStorage(output);
-  int64_t outputStorageOffset = output.storage_offset() * output.element_size();
   uint32_t numThreads = output.numel();
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync(mpsStream->queue(), ^() {
-    id<MTLComputeCommandEncoder> computeEncoder = [mpsStream->commandBuffer() computeCommandEncoder];
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
     std::string functionName = getGatherScatterFunctionName(output.scalar_type(), output.dim(), /*needsScatter=*/false);
     id<MTLComputePipelineState> gatherPSO = getPipelineState(MPSDevice::getInstance()->device(),
                                                              functionName,
                                                              getGatherScatterScalarType(src),
                                                              getGatherScatterScalarType(output),
-                                                             /*needsScatter=*/false);
+                                                             /*needsScatter=*/false,
+                                                             src.is_conj() != dst.is_conj());
+
+    // this function call is a no-op if MPS Profiler is not enabled
+    getMPSProfiler().beginProfileKernel(gatherPSO, functionName, {src, output});
 
     uint32_t kernel_size = src.sizes().size();
     std::vector<uint32_t> src_sizes(kernel_size == 0 ? 1 : kernel_size);
@@ -844,22 +869,14 @@ Tensor gatherViewTensor(const at::Tensor& src, at::Tensor& dst) {
     }
 
     [computeEncoder setComputePipelineState:gatherPSO];
-    [computeEncoder setBuffer:getMTLBufferStorage(src) offset:src.storage_offset() * src.element_size() atIndex:0];
-    [computeEncoder setBuffer:outputBuffer offset:outputStorageOffset atIndex:1];
+    mtl_setBuffer(computeEncoder, src, 0);
+    mtl_setBuffer(computeEncoder, dst.has_storage() ? dst : output, 1);
     [computeEncoder setBytes:&src_sizes[0] length:sizeof(uint32_t) * kernel_size atIndex:2];
     [computeEncoder setBytes:&src_strides[0] length:sizeof(uint32_t) * kernel_size atIndex:3];
     [computeEncoder setBytes:&numThreads length:sizeof(uint32_t) atIndex:4];
+    mtl_dispatch1DJob(computeEncoder, gatherPSO, numThreads);
 
-    MTLSize gridSize = MTLSizeMake(numThreads, 1, 1);
-    NSUInteger threadsPerThreadgroup_ = gatherPSO.maxTotalThreadsPerThreadgroup;
-    if (threadsPerThreadgroup_ > numThreads) {
-      threadsPerThreadgroup_ = numThreads;
-    }
-
-    MTLSize threadsPerThreadgroup = MTLSizeMake(threadsPerThreadgroup_, 1, 1);
-    [computeEncoder dispatchThreads:gridSize threadsPerThreadgroup:threadsPerThreadgroup];
-    [computeEncoder endEncoding];
-    mpsStream->synchronize(SyncType::COMMIT_AND_CONTINUE);
+    getMPSProfiler().endProfileKernel(gatherPSO);
   });
 
   return (dst.has_storage()) ? dst : output;
@@ -879,22 +896,21 @@ Tensor& scatterViewTensor(const at::Tensor& src, at::Tensor& output) {
     return output;
   }
 
-  id<MTLBuffer> outputBuffer = getMTLBufferStorage(output);
-  id<MTLBuffer> sourceBuffer = getMTLBufferStorage(src);
   uint32_t numThreads = src.numel();
-  int64_t outputStorageOffset = output.storage_offset() * output.element_size();
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync(mpsStream->queue(), ^() {
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
     @autoreleasepool {
-      id<MTLCommandBuffer> commandBuffer = mpsStream->commandBuffer();
-      id<MTLComputeCommandEncoder> computeEncoder = [commandBuffer computeCommandEncoder];
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       std::string functionName =
           getGatherScatterFunctionName(output.scalar_type(), output.dim(), /*needsScatter=*/true);
       id<MTLComputePipelineState> scatterPSO = getPipelineState(MPSDevice::getInstance()->device(),
                                                                 functionName,
                                                                 getGatherScatterScalarType(src),
                                                                 getGatherScatterScalarType(output),
-                                                                /*needsScatter=*/true);
+                                                                /*needsScatter=*/true,
+                                                                src.is_conj() != output.is_conj());
+
+      getMPSProfiler().beginProfileKernel(scatterPSO, functionName, {src, output});
 
       uint32_t kernel_size = output.sizes().size();
       std::vector<uint32_t> output_sizes(kernel_size == 0 ? 1 : kernel_size);
@@ -910,22 +926,14 @@ Tensor& scatterViewTensor(const at::Tensor& src, at::Tensor& output) {
       }
 
       [computeEncoder setComputePipelineState:scatterPSO];
-      [computeEncoder setBuffer:sourceBuffer offset:src.storage_offset() * src.element_size() atIndex:0];
-      [computeEncoder setBuffer:outputBuffer offset:outputStorageOffset atIndex:1];
+      mtl_setBuffer(computeEncoder, src, 0);
+      mtl_setBuffer(computeEncoder, output, 1);
       [computeEncoder setBytes:&output_sizes[0] length:sizeof(uint32_t) * kernel_size atIndex:2];
       [computeEncoder setBytes:&output_strides[0] length:sizeof(uint32_t) * kernel_size atIndex:3];
       [computeEncoder setBytes:&numThreads length:sizeof(uint32_t) atIndex:4];
+      mtl_dispatch1DJob(computeEncoder, scatterPSO, numThreads);
 
-      MTLSize gridSize = MTLSizeMake(numThreads, 1, 1);
-      NSUInteger threadsPerThreadgroup_ = scatterPSO.maxTotalThreadsPerThreadgroup;
-      if (threadsPerThreadgroup_ > numThreads) {
-        threadsPerThreadgroup_ = numThreads;
-      }
-
-      MTLSize threadsPerThreadgroup = MTLSizeMake(threadsPerThreadgroup_, 1, 1);
-      [computeEncoder dispatchThreads:gridSize threadsPerThreadgroup:threadsPerThreadgroup];
-      [computeEncoder endEncoding];
-      mpsStream->synchronize(SyncType::COMMIT_AND_CONTINUE);
+      getMPSProfiler().endProfileKernel(scatterPSO);
     }
   });
 

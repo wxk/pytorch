@@ -44,7 +44,7 @@ template<class T, class Iterator> class ListIterator;
 template<class T, class Iterator> class ListElementReference;
 
 template<class T, class Iterator>
-void swap(ListElementReference<T, Iterator>&& lhs, ListElementReference<T, Iterator>&& rhs);
+void swap(ListElementReference<T, Iterator>&& lhs, ListElementReference<T, Iterator>&& rhs) noexcept;
 
 template<class T, class Iterator>
 bool operator==(const ListElementReference<T, Iterator>& lhs, const T& rhs);
@@ -68,8 +68,8 @@ template<class T, class Iterator>
 class ListElementReference final {
 public:
   operator std::conditional_t<
-      std::is_reference<typename c10::detail::
-                            ivalue_to_const_ref_overload_return<T>::type>::value,
+      std::is_reference_v<typename c10::detail::
+                            ivalue_to_const_ref_overload_return<T>::type>,
       const T&,
       T>() const;
 
@@ -78,13 +78,13 @@ public:
   ListElementReference& operator=(const T& new_value) &&;
 
   // assigning another ref to this assigns the underlying value
-  ListElementReference& operator=(ListElementReference&& rhs) &&;
+  ListElementReference& operator=(ListElementReference&& rhs) && noexcept;
 
   const IValue& get() const& {
     return *iterator_;
   }
 
-  friend void swap<T, Iterator>(ListElementReference&& lhs, ListElementReference&& rhs);
+  friend void swap<T, Iterator>(ListElementReference&& lhs, ListElementReference&& rhs) noexcept;
 
   ListElementReference(const ListElementReference&) = delete;
   ListElementReference& operator=(const ListElementReference&) = delete;
@@ -124,7 +124,7 @@ class ListIterator final {
   ListIterator(const ListIterator&) = default;
   ListIterator(ListIterator&&) noexcept = default;
   ListIterator& operator=(const ListIterator&) = default;
-  ListIterator& operator=(ListIterator&&) = default;
+  ListIterator& operator=(ListIterator&&) noexcept = default;
 
   ListIterator& operator++() {
       ++iterator_;
@@ -285,7 +285,7 @@ public:
    * Returns the element at specified location pos, with bounds checking.
    * If pos is not within the range of the container, an exception of type std::out_of_range is thrown.
    */
-  value_type get(size_type pos) const;
+  internal_const_reference_type get(size_type pos) const;
 
   /**
    * Moves out the element at the specified location pos and returns it, with bounds checking.

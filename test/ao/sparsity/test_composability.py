@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Owner(s): ["module: unknown"]
 
 
@@ -22,7 +21,7 @@ sparse_defaults = {
     "zeros_per_block": 4,
 }
 
-def _get_model_and_pruner_and_sparse_config(qconfig=None):
+def _get_model_and_sparsifier_and_sparse_config(qconfig=None):
     model = nn.Sequential(
         nn.Linear(4, 4),  # 0
         nn.ReLU(),
@@ -37,7 +36,7 @@ def _get_model_and_pruner_and_sparse_config(qconfig=None):
         model[4].qconfig = qconfig
         model[5].qconfig = qconfig
 
-    pruner = pruning.WeightNormPruner(**sparse_defaults)
+    sparsifier = pruning.WeightNormSparsifier(**sparse_defaults)
 
     sparse_config = [
         {
@@ -48,7 +47,7 @@ def _get_model_and_pruner_and_sparse_config(qconfig=None):
         },
         {"tensor_fqn": "0.weight"},
     ]
-    return model, pruner, sparse_config
+    return model, sparsifier, sparse_config
 
 def _squash_mask_calibrate_and_convert(model, sparsifier, input):
     sparsifier.step()
@@ -71,7 +70,7 @@ class TestComposability(TestCase):
             mod,
             sparsifier,
             sparse_config,
-        ) = _get_model_and_pruner_and_sparse_config(tq.get_default_qconfig("fbgemm"))
+        ) = _get_model_and_sparsifier_and_sparse_config(tq.get_default_qconfig("fbgemm"))
 
         tq.prepare(mod, inplace=True)
         sparsifier.prepare(mod, config=sparse_config)
@@ -100,7 +99,7 @@ class TestComposability(TestCase):
             mod,
             sparsifier,
             sparse_config,
-        ) = _get_model_and_pruner_and_sparse_config(tq.get_default_qconfig("fbgemm"))
+        ) = _get_model_and_sparsifier_and_sparse_config(tq.get_default_qconfig("fbgemm"))
 
         sparsifier.prepare(mod, config=sparse_config)
         tq.prepare(mod, inplace=True)
@@ -111,7 +110,7 @@ class TestComposability(TestCase):
         self.assertTrue(hasattr(mod[5], "parametrizations"))
 
         # check that correct observers were inserted and that matching
-        # occured successfully
+        # occurred successfully
         self.assertTrue(hasattr(mod[5], "activation_post_process"))
 
         _squash_mask_calibrate_and_convert(
@@ -131,7 +130,7 @@ class TestComposability(TestCase):
             mod,
             sparsifier,
             sparse_config,
-        ) = _get_model_and_pruner_and_sparse_config(tq.get_default_qconfig("fbgemm"))
+        ) = _get_model_and_sparsifier_and_sparse_config(tq.get_default_qconfig("fbgemm"))
 
         sparsifier.prepare(mod, config=sparse_config)
         tq.prepare(mod, inplace=True)
@@ -142,7 +141,7 @@ class TestComposability(TestCase):
         self.assertTrue(hasattr(mod[5], "parametrizations"))
 
         # check that correct observers were inserted and that matching
-        # occured successfully
+        # occurred successfully
         self.assertTrue(hasattr(mod[5], "activation_post_process"))
         sparsifier.step()
         sparsity_level = _calculate_sparsity(mod[5].weight)
@@ -169,7 +168,7 @@ class TestComposability(TestCase):
             mod,
             sparsifier,
             sparse_config,
-        ) = _get_model_and_pruner_and_sparse_config(tq.get_default_qconfig("fbgemm"))
+        ) = _get_model_and_sparsifier_and_sparse_config(tq.get_default_qconfig("fbgemm"))
         sparsifier.prepare(mod, config=sparse_config)
         tq.fuse_modules(mod, [["5", "6"]], inplace=True)
         mod[5].qconfig = tq.get_default_qconfig("fbgemm")
@@ -181,7 +180,7 @@ class TestComposability(TestCase):
         self.assertTrue(hasattr(mod[5][0], "parametrizations"))
 
         # check that correct observers were inserted and that matching
-        # occured successfully
+        # occurred successfully
         self.assertTrue(hasattr(mod[5], "activation_post_process"))
         _squash_mask_calibrate_and_convert(
             mod, sparsifier, torch.randn(1, 4, 4, 4)
@@ -198,7 +197,7 @@ class TestComposability(TestCase):
             mod,
             sparsifier,
             _,
-        ) = _get_model_and_pruner_and_sparse_config(tq.get_default_qconfig("fbgemm"))
+        ) = _get_model_and_sparsifier_and_sparse_config(tq.get_default_qconfig("fbgemm"))
         tq.fuse_modules(mod, [["5", "6"]], inplace=True)
 
         # its absolutely broken by fusion but will still work if you put the correct fqn in
@@ -222,7 +221,7 @@ class TestComposability(TestCase):
         self.assertTrue(hasattr(mod[5][0], "parametrizations"))
 
         # check that correct observers were inserted and that matching
-        # occured successfully
+        # occurred successfully
         self.assertTrue(hasattr(mod[5], "activation_post_process"))
         sparsifier.step()
         sparsity_level = _calculate_sparsity(mod[5][0].weight)
@@ -243,14 +242,14 @@ class TestComposability(TestCase):
 
     # This tests whether performing sparse prepare before qat prepare causes issues.
     # The primary worries were that qat_prep wouldn't recognize the parametrized
-    # modules and that the convert step for qat would remove the paramerizations
+    # modules and that the convert step for qat would remove the parametrizations
     # from the modules.
     def test_s_prep_before_qat_prep(self):
         (
             mod,
             sparsifier,
             sparse_config,
-        ) = _get_model_and_pruner_and_sparse_config(
+        ) = _get_model_and_sparsifier_and_sparse_config(
             tq.get_default_qat_qconfig("fbgemm")
         )
         sparsifier.prepare(mod, config=sparse_config)
@@ -259,7 +258,7 @@ class TestComposability(TestCase):
         self.assertTrue(hasattr(mod[5], "parametrizations"))
 
         # check that correct observers were inserted and that matching
-        # occured successfully
+        # occurred successfully
         self.assertTrue(hasattr(mod[5], "activation_post_process"))
         self.assertTrue(isinstance(mod[5], torch.ao.nn.qat.Linear))
         _squash_mask_calibrate_and_convert(
@@ -275,7 +274,7 @@ class TestComposability(TestCase):
 
     # This tests whether performing qat prepare before sparse prepare causes issues.
     def test_qat_prep_before_s_prep(self):
-        mod, sparsifier, _ = _get_model_and_pruner_and_sparse_config(
+        mod, sparsifier, _ = _get_model_and_sparsifier_and_sparse_config(
             tq.get_default_qat_qconfig("fbgemm")
         )
         tq.prepare_qat(mod, inplace=True)
@@ -298,7 +297,7 @@ class TestComposability(TestCase):
         self.assertTrue(hasattr(mod[5], "parametrizations"))
 
         # check that correct observers were inserted and that matching
-        # occured successfully
+        # occurred successfully
         self.assertTrue(hasattr(mod[5], "activation_post_process"))
         self.assertTrue(isinstance(mod[5], torch.ao.nn.qat.Linear))
 
@@ -337,7 +336,7 @@ class TestFxComposability(TestCase):
             mod,
             sparsifier,
             _,
-        ) = _get_model_and_pruner_and_sparse_config()
+        ) = _get_model_and_sparsifier_and_sparse_config()
 
         example = torch.randn(1, 4, 4, 4)
         qconfig = tq.get_default_qconfig("fbgemm")
@@ -367,7 +366,7 @@ class TestFxComposability(TestCase):
         self.assertTrue(hasattr(fqn_to_module(mod, "5.0"), "parametrizations"))
 
         # check that correct observers were inserted and that matching
-        # occured successfully
+        # occurred successfully
         self.assertTrue(_module_has_activation_post_process(mod, "5"))
         sparsifier.step()
         sparsity_level = _calculate_sparsity(fqn_to_module(mod, "5.0.weight"))
@@ -396,7 +395,7 @@ class TestFxComposability(TestCase):
             mod,
             sparsifier,
             _,
-        ) = _get_model_and_pruner_and_sparse_config()
+        ) = _get_model_and_sparsifier_and_sparse_config()
 
         example = torch.randn(1, 4, 4, 4)
         qconfig = tq.get_default_qconfig("fbgemm")
@@ -425,7 +424,7 @@ class TestFxComposability(TestCase):
         self.assertTrue(hasattr(fqn_to_module(mod, "5.0"), "parametrizations"))
 
         # check that correct observers were inserted and that matching
-        # occured successfully
+        # occurred successfully
         self.assertTrue(_module_has_activation_post_process(mod, "5"))
         sparsifier.step()
         sparsity_level = _calculate_sparsity(fqn_to_module(mod, "5.0.weight"))
@@ -455,7 +454,7 @@ class TestFxComposability(TestCase):
             mod,
             sparsifier,
             sparse_config,
-        ) = _get_model_and_pruner_and_sparse_config()
+        ) = _get_model_and_sparsifier_and_sparse_config()
         sparsifier.prepare(mod, config=sparse_config)
 
         example = torch.randn(1, 4, 4, 4)
@@ -471,7 +470,7 @@ class TestFxComposability(TestCase):
         self.assertTrue(hasattr(fqn_to_module(mod, "5.0"), "parametrizations"))
 
         # check that correct observers were inserted and that matching
-        # occured successfully
+        # occurred successfully
         self.assertTrue(_module_has_activation_post_process(mod, "5"))
         sparsifier.step()
         sparsity_level = _calculate_sparsity(fqn_to_module(mod, "5.0.weight"))
@@ -500,7 +499,7 @@ class TestFxComposability(TestCase):
             mod,
             sparsifier,
             sparse_config,
-        ) = _get_model_and_pruner_and_sparse_config()
+        ) = _get_model_and_sparsifier_and_sparse_config()
         sparsifier.prepare(mod, config=sparse_config)
 
         example = torch.randn(1, 4, 4, 4)
@@ -517,7 +516,7 @@ class TestFxComposability(TestCase):
         self.assertTrue(isinstance(fqn_to_module(mod, "5"), torch.ao.nn.intrinsic.qat.LinearReLU))
 
         # check that correct observers were inserted and that matching
-        # occured successfully
+        # occurred successfully
         self.assertTrue(_module_has_activation_post_process(mod, "5"))
         sparsifier.step()
         sparsity_level = _calculate_sparsity(fqn_to_module(mod, "5.weight"))
@@ -546,7 +545,7 @@ class TestFxComposability(TestCase):
             mod,
             sparsifier,
             sparse_config,
-        ) = _get_model_and_pruner_and_sparse_config()
+        ) = _get_model_and_sparsifier_and_sparse_config()
         sparsifier.prepare(mod, config=sparse_config)
 
         example = torch.randn(1, 4, 4, 4)
@@ -562,7 +561,7 @@ class TestFxComposability(TestCase):
         self.assertTrue(hasattr(fqn_to_module(mod, "5.0"), "parametrizations"))
 
         # check that correct observers were inserted and that matching
-        # occured successfully
+        # occurred successfully
         self.assertTrue(_module_has_activation_post_process(mod, "5"))
         sparsifier.step()
         sparsity_level = _calculate_sparsity(fqn_to_module(mod, "5.0.weight"))

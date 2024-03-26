@@ -2,14 +2,15 @@ import logging
 import os
 import tempfile
 from enum import Enum
-from typing import Dict, List, Set, Tuple, Union
+from typing import Callable, cast, Dict, Iterable, List, Set
 
 import torch.fx as fx
 from torch.fx.passes.shape_prop import TensorMetadata
+from torch.utils import _pytree as pytree
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 
-logger: logging.Logger = logging.getLogger("IterGraphModule")
+logger: logging.Logger = logging.getLogger("graph_utils")
 
 
 class OP(str, Enum):
@@ -29,60 +30,6 @@ class CommType(str, Enum):
     SCATTER = "scatter_"
 
 
-comm_block_op_sequence: Tuple[Union[str, Set[CommType]], ...] = (
-    "clone",
-    "_tensor_constant",
-    "_tensor_constant",
-    # The supported communication type.
-    {CommType.ALLREDUCE},
-    "comm_result",
-    "getitem",
-    "getitem",
-    "wait_comm",
-)
-
-
-def get_comm_block_nodes(
-    wait_node: fx.Node, comm_type: CommType
-) -> Tuple[int, List[fx.Node]]:
-    """
-    Given a wait_comm node, find out all the nodes belong to this communication.
-
-    Args:
-        wait_node(fx.Node): The target wait_comm node.
-        comm_type(CommType): The communication type of this communication block.
-            Currently, only allreduce is supported. An exception will be raised
-            if other values are passed.
-    Returns:
-        comm_idx(int): The index to the communication node in the return list.
-        node_list(List[fx.Node]): The list that contain the nodes in the order
-           of inserting to the graph.
-    """
-    if not wait_node.name.startswith("wait_comm"):
-        raise ValueError(
-            "Passing a wait_node that name does not start with ``wait_comm``. "
-            f"Name is {wait_node.name}, OP is {wait_node.op}."
-        )
-    node = wait_node
-    node_list = []
-    for i, prefix in enumerate(reversed(comm_block_op_sequence)):
-        node_list.append(node)
-        if isinstance(prefix, set):
-            if comm_type not in prefix:
-                raise ValueError(f"Not supported CommType {comm_type}")
-            prefix = comm_type
-            comm_idx = i
-        assert node.name.startswith(
-            prefix
-        ), f"Comm block op sequence mismatches, {node.op} {node.name} {i} {prefix}."
-        node = node.prev
-
-    comm_idx = len(node_list) - comm_idx - 1
-    node_list.reverse()
-
-    return comm_idx, node_list
-
-
 def get_node_tensor_metadata(node: fx.Node, is_required: bool = True) -> TensorMetadata:
     metadata = node.meta.get("tensor_meta", None)
     if is_required and metadata is None:
@@ -94,9 +41,9 @@ def get_node_tensor_metadata(node: fx.Node, is_required: bool = True) -> TensorM
 
 
 def get_output(graph: fx.Graph) -> fx.Node:
-    """
-    Take a graphmodule and returns the graph output node. We traverse in reverse
-    to expedite it, with the idea that last node should be output
+    """Take a graphmodule and return the graph output node.
+
+    We traverse in reverse to expedite it, with the idea that last node should be output
     """
     for node in reversed(graph.nodes):
         if node.op == OP.OUTPUT:
@@ -104,9 +51,19 @@ def get_output(graph: fx.Graph) -> fx.Node:
     raise RuntimeError(f"Cannot find the output node in {graph}")
 
 
+def find_node(
+    graph: fx.Graph, predicate: Callable, reverse_order: bool = False
+) -> List[fx.Node]:
+    """Take a predicate and return all the nodes in the `graph` where the predicate holds."""
+    nodes = cast(Iterable[fx.Node], graph.nodes)
+    if reverse_order:
+        nodes = cast(Iterable[fx.Node], iter(reversed(nodes)))  # type: ignore[call-overload]
+    return [node for node in nodes if predicate(node)]
+
+
 def is_leaf_subgraph(graph: fx.Graph, subgraph: List[fx.Node]) -> bool:
-    """
-    This function ensures nodes in ``subgraph`` satisfy one of the rules:
+    """Ensure nodes in ``subgraph`` satisfy one of the following rules.
+
     1. The user of the node is in ``subgraph``.
     2. The user of the node is output.
     3. There are no users -- the node is a side-effect node.
@@ -125,11 +82,10 @@ def is_leaf_subgraph(graph: fx.Graph, subgraph: List[fx.Node]) -> bool:
 def clone_subgraph(
     graph: fx.Graph, subgraph: List[fx.Node], target: fx.Node
 ) -> List[fx.Node]:
-    """
-    Clone the given subgraph and insert it before ``target``.
+    """Clone the given subgraph and insert it before ``target``.
+
     This API currently does not support inserting after ``target``.
     """
-
     all_nodes = set(subgraph)
     mapping: Dict[fx.Node, fx.Node] = dict()
     cloned_subgraph = []
@@ -141,13 +97,16 @@ def clone_subgraph(
             # TODO: there are many flatten/unflatten in IterGraph that
             # can be simplified with tree_map. Will simplify this in
             # a follow-up PR.
-            original_input, _ = tree_flatten((node.args, node.kwargs))
+            original_input = pytree.arg_tree_leaves(*node.args, **node.kwargs)
             cloned_input, spec = tree_flatten((cloned_node.args, cloned_node.kwargs))
             mapped_cloned_input = []
             for original_input_node, cloned_input_node in zip(
                 original_input, cloned_input
             ):
-                if original_input_node in all_nodes:
+                if (
+                    isinstance(original_input_node, fx.Node)
+                    and original_input_node in all_nodes
+                ):
                     assert original_input_node in mapping
                     mapped_cloned_input.append(mapping[original_input_node])
                 else:
@@ -162,12 +121,11 @@ def clone_subgraph(
 
 
 def rebuild_graph(gm: fx.GraphModule, remove_dead_code: bool = True) -> None:
-    """
-    Runs the required steps to ensure production-ready graph.
-    note - per the fx docs, eliminate dead code is not very precise.
+    """Run the required steps to ensure production-ready graph.
+
+    Note - per the fx docs, elimination of dead code is not very precise.
     Hence, the flag to make this step optional.
     """
-
     gm.graph.lint()
     if remove_dead_code:
         gm.graph.eliminate_dead_code()

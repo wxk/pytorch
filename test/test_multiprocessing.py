@@ -18,6 +18,7 @@ from torch.testing._internal.common_utils import (TestCase, run_tests, IS_WINDOW
                                                   load_tests, slowTest, TEST_WITH_TSAN, TEST_WITH_TORCHDYNAMO,
                                                   TEST_WITH_ROCM, IS_MACOS)
 
+
 # load_tests from common_utils is used to automatically filter tests for
 # sharding on sandcastle. This line silences flake warnings
 load_tests = load_tests
@@ -30,6 +31,9 @@ TEST_CUDA_IPC = torch.cuda.is_available() and \
     sys.platform != 'win32' and \
     not TEST_WITH_ROCM  # https://github.com/pytorch/pytorch/issues/90940
 TEST_MULTIGPU = TEST_CUDA_IPC and torch.cuda.device_count() > 1
+
+if TEST_CUDA_IPC:
+    torch.cuda.memory._set_allocator_settings('expandable_segments:False')
 
 
 class SubProcess(mp.Process):
@@ -425,7 +429,7 @@ class TestMultiprocessing(TestCase):
         ctx = mp.get_context('fork')
         simple_autograd_function()
         # Autograd only uses thread when GPUs are involved
-        if torch.cuda.is_available() or torch.backends.mps.is_available():
+        if torch.cuda.is_available() or torch.backends.mps.is_available() or torch.xpu.is_available():
             with self.assertRaisesRegex(RuntimeError, r'Unable to handle autograd'):
                 with ctx.Pool(3) as pool:
                     pool.map(simple_autograd_function, [1, 2, 3])

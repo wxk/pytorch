@@ -2,8 +2,10 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 import copy
 import torch
-from torch.fx.graph import Graph
-from torch.fx.node import Node
+from torch.fx import (
+    Node,
+    Graph,
+)
 from torch.fx._compatibility import compatibility
 from typing import Dict, List, Set, Any, Union, Tuple
 import logging
@@ -30,7 +32,7 @@ logger = _init_logger()
 
 @compatibility(is_backward_compatible=False)
 @dataclass
-class InternalMatch():
+class InternalMatch:
     # Nodes from which the match was found
     anchors: List[Node]
     # Maps nodes in the pattern subgraph to nodes in the larger graph
@@ -41,6 +43,10 @@ class InternalMatch():
 
     # nodes in matched subgraph returned by output
     returning_nodes: List[Node] = field(default_factory=list)
+
+    # map from a string name to a node in the target graph
+    # only available if the matcher is `SubgraphMatcherWithNameNodesMap`
+    name_node_map: Dict[str, Node] = field(default_factory=dict)
 
     def __copy__(self):
         return InternalMatch(anchors=self.anchors, nodes_map=self.nodes_map.copy(),
@@ -100,8 +106,20 @@ class SubgraphMatcher:
         # Attributes matching is complicated. Right now we only support matching constant tensor
         assert isinstance(pn.target, str), f"pn.target {pn.target} must be a string."
         assert isinstance(gn.target, str), f"gn.target {gn.target} must be a string."
-        pn_value = getattr(pn.graph.owning_module, pn.target)
-        gn_value = getattr(gn.graph.owning_module, gn.target)
+
+        # TODO(tmanlaibaatar) should probably make this actual API
+        def _getattr(model: torch.fx.GraphModule, attr_name: str):
+            *prefix, field = attr_name.split(".")
+            t = model
+            for item in prefix:
+                t = getattr(t, item, None)  # type: ignore[assignment]
+                assert t is not None
+
+            return getattr(t, field)
+
+        pn_value = _getattr(pn.graph.owning_module, pn.target)
+        gn_value = _getattr(gn.graph.owning_module, gn.target)
+
         if type(pn_value) != type(gn_value):
             return False
 
@@ -221,24 +239,50 @@ class SubgraphMatcher:
                 elif isinstance(a1, (list, tuple)) and isinstance(a2, (list, tuple)):
                     matched = _match_args(a1, a2)
                 else:
-                    matched = self.ignore_literals or self._match_literals(a1, a2, match)
+                    matched = self._match_literals(a1, a2, match) or self.ignore_literals
 
                 if not matched:
                     return False
 
             return True
 
-        match_found = match_found and _match_args(pn.args, gn.args)
+        # Flatten all args/kwargs into 1 list of args
+        pn_args, gn_args = None, None
+        if (
+            (len(pn.args) != len(gn.args) or list(pn.kwargs.keys()) != list(gn.kwargs.keys())) and
+            pn.op == "call_function" and
+            isinstance(pn.target, torch._ops.OpOverload)
+        ):
+            args_schema = pn.target._schema.arguments
 
-        pn_kwargs, gn_kwargs = [], []
-        if pn.kwargs.keys() == gn.kwargs.keys():
-            for key in pn.kwargs.keys():
-                pn_kwargs.append(pn.kwargs[key])
-                gn_kwargs.append(gn.kwargs[key])
+            def get_all_arguments(orig_args, orig_kwargs):
+                all_args = []
+                for i, schema in enumerate(args_schema):
+                    if schema.name in orig_kwargs:
+                        all_args.append(orig_kwargs[schema.name])
+                    elif not schema.kwarg_only and i < len(orig_args):
+                        all_args.append(orig_args[i])
+                    else:
+                        all_args.append(schema.default_value)
+                return all_args
+
+            pn_args = get_all_arguments(pn.args, pn.kwargs)
+            gn_args = get_all_arguments(gn.args, gn.kwargs)
+
+        elif len(pn.args) == len(gn.args) and list(pn.kwargs.keys()) == list(gn.kwargs.keys()):
+            pn_args = list(pn.args)
+            gn_args = list(gn.args)
+            pn_args.extend(list(pn.kwargs.values()))
+            gn_args.extend(list(gn.kwargs.values()))
         else:
             match_found = False
 
-        match_found = match_found and _match_args(pn_kwargs, gn_kwargs)
+        match_found = (
+            match_found and
+            pn_args is not None and
+            gn_args is not None and
+            _match_args(pn_args, gn_args)
+        )
 
         if not match_found:
             # revert to saved_match before matching with current node
@@ -333,7 +377,7 @@ class SubgraphMatcher:
         if before != after:
             logger.info("Filtered out %s matches because they are not fully contained", before - after)
 
-        # filter out the matches that that forms a cycle if the subgraph is fused
+        # filter out the matches that form a cycle if the subgraph is fused
         valid_matches = []
         for match in matches:
             matched_compute_nodes = \
